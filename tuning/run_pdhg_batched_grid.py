@@ -395,6 +395,18 @@ def main() -> None:
     print(f"Chunk size: {chunk_size} -> {total_chunks} chunks")
 
     if args.dry_run:
+        started_at = time.time()
+        update_progress(
+            study_paths.progress_path,
+            status="dry_run",
+            total_candidates=len(candidates),
+            completed_candidates=0,
+            total_chunks=total_chunks,
+            completed_chunks=0,
+            current_chunk_index=None,
+            started_at=started_at,
+            rows=None,
+        )
         preview = candidates[: min(5, len(candidates))]
         print("Preview candidates:")
         for candidate in preview:

@@ -94,3 +94,20 @@ The Colab notebook includes cells to:
 - launch the sweep in the background
 - inspect the latest `progress.json`
 - tail the latest log file
+
+## Colab Installs
+
+For Colab, do not run the full `requirements.txt`. It downgrades the runtime's
+preinstalled PyTorch and notebook stack and can destabilize the session.
+
+Use `requirements-colab.txt` instead. It only installs the small set of
+packages needed for the batched phase-retrieval tuning workflow:
+
+- `hydra-core`
+- `omegaconf`
+- `gdown`
+- `piq`
+- `prettytable`
+- `setproctitle`
+- `wandb`
+- `imageio`
