@@ -1,0 +1,121 @@
+lgvd_config:
+  num_steps: 10
+  lr: 5e-4
+  tau: 0.01
+  lr_min_ratio: 0.01
+
+admm_config:
+  max_iter: 220
+  rho: 100
+  eta: 0.99
+  gamma: 1
+  low_t_patience: 40
+  delta_tol: 1e-10
+  delta_patience: 10
+  init_factor:
+    x: 0.01
+    z: 0.01
+    u: 0
+  ml:
+    max_iter: 1000
+    lr: 1.0e-1
+    tol: 1.0e-1
+    optimizer: Adam
+    clip: False
+    lr_decay: 1.3
+    lr_min: 1.0e-25
+    patience: 3
+    verbose: False
+    reg_use_freq: 1
+  denoise:
+    type: denoise
+    final_step: ode
+    t_window_max: 10
+    t_window_min: 3
+    t_minimum: 20
+    lgvd:
+      reg_factor: 100
+      num_steps: 10
+      lr: 5.0e-4
+      drift_clip: 10.0            # NEW (defaults to 10 anyway)
+      noise_scale: 1.0            # NEW (defaults to 1)
+      max_tether_step: null       # NEW (disabled)
+    diffusion:
+      beta_start: 0.0001
+      beta_end: 0.02
+      T: 1000
+  dys:
+    order: denoise_first          # or "denoise_last"
+    use_physics_prox: false       # set true if you have operator.proj_amplitude
+    tau: 0.5                      # only if use_physics_prox=true
+    gamma: 0.1
+    lambda_schedule:
+      activate: true
+      start: 0.2
+      end: 1.0
+      warmup: 50
+    diagnostics:
+      activate: true
+      every: 5
+      compare_acdc: true
+      compare_det_dc: true
+      score_norm: false
+      mismatch_gt: true           # only meaningful if you pass gt
+  pdhg:
+    # ----- Step sizes (stability ~ tau * sigma_dual * ||K||^2 < 1)
+    # With norm="ortho" FFT and padding/cropping, ||K|| ~ 1, so start around 0.5–0.9.
+    tau: 0.01
+    sigma_dual: 1200
+
+    # ----- Extrapolation (theta in [0,1]; 1.0 is common)
+    theta_schedule:
+      activate: true
+      start: 0.0
+      end: 0.0
+      warmup: 50
+
+    # ----- Practical stabilizers
+    use_box_proj: false        # clamp to [-1,1] after denoise
+    proj_min: -1.0            # optional override; otherwise uses admm_config.proj.*
+    proj_max: 1.0
+
+    # ----- Operator/FFT conventions
+    # If you implement operator.forward_complex(x01) and operator.adjoint_complex(p, out_hw),
+    # set this to true to avoid fallback FFT that might mismatch your fft2c_new conventions.
+    use_operator_complex: true
+    fft_norm: ortho           # "ortho" if you use norm="ortho" everywhere; else "backward"
+
+    # ----- Data fidelity parameters for phase retrieval
+    # Usually take from operator.sigma (0.05), but you can override.
+    sigma_n: 0.05
+
+    # ----- Dual initialization
+    init_dual: noise          # "zeros" or "noise"
+  drs:
+    # ----- Step sizes (stability ~ tau * sigma_dual * ||K||^2 < 1)
+    # With norm="ortho" FFT and padding/cropping, ||K|| ~ 1, so start around 0.5–0.9.
+    tau: 0.01
+    sigma_dual: 1200
+
+    # ----- Extrapolation (theta in [0,1]; 1.0 is common)
+    theta_schedule:
+      activate: false
+      start: 0.0
+      end: 0.0
+      warmup: 50
+
+    # ----- Practical stabilizers
+    use_box_proj: true        # clamp to [-1,1] after denoise
+    proj_min: -1.0            # optional override; otherwise uses admm_config.proj.*
+    proj_max: 1.0
+
+    # ----- Data fidelity parameters for phase retrieval
+    # Usually take from operator.sigma (0.05), but you can override.
+    sigma_n: 0.05
+
+    # ----- Dual initialization
+    init_dual: noise          # "zeros" or "noise"
+operator:
+  name: phase_retrieval
+  oversample: 2.0
+  sigma: 0.05
