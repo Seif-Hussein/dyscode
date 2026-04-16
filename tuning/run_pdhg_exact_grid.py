@@ -218,6 +218,10 @@ def sort_rows(rows: list[dict[str, Any]], scoring_cfg: dict[str, Any]) -> list[d
     return sorted(rows, key=lambda row: row["score"], reverse=reverse)
 
 
+def get_successful_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row.get("status") == "ok"]
+
+
 def build_command(
     cfg: dict[str, Any],
     candidate: dict[str, Any],
@@ -274,8 +278,9 @@ def update_progress(
         "eta_seconds": eta_seconds,
     }
 
-    if rows:
-        best_row = rows[0]
+    successful_rows = get_successful_rows(rows or [])
+    if successful_rows:
+        best_row = successful_rows[0]
         payload["best_so_far"] = {
             "candidate_index": best_row["candidate_index"],
             "score": best_row["score"],
@@ -467,8 +472,9 @@ def main() -> int:
                 f"Completed candidate {completed}/{len(candidates)}. "
                 f"Elapsed: {elapsed / 60:.1f} min, ETA: {eta_seconds / 60:.1f} min."
             )
-            if sorted_rows:
-                best = sorted_rows[0]
+            successful_rows = get_successful_rows(sorted_rows)
+            if successful_rows:
+                best = successful_rows[0]
                 print(
                     "Current best: "
                     f"idx={best['candidate_index']} score={best['score']:.4f} "

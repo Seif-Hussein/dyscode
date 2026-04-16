@@ -65,15 +65,20 @@ def main(args):
         eval_fn_list.append(get_eval_fn(eval_fn_name))
     evaluator = Evaluator(eval_fn_list)
 
+    # Recording full trajectories is extremely memory-heavy for long runs and
+    # should only be enabled when the user explicitly asked to save them.
+    record_trajectory = bool(args.save_traj or args.save_traj_raw_data)
+
     # main sampling process
     full_samples = []
     full_trajs = []
     for r in range(args.num_runs):
         print(f'Run: {r}')
         samples, trajs = sample_in_batch(sampler, model, images, operator, y, evaluator, verbose=True,
-                                         record=True, batch_size=args.batch_size, gt=images, wandb=args.wandb)
+                                         record=record_trajectory, batch_size=args.batch_size, gt=images, wandb=args.wandb)
         full_samples.append(samples)
-        full_trajs.append(trajs)
+        if record_trajectory:
+            full_trajs.append(trajs)
     full_samples = torch.stack(full_samples, dim=0)
     """trace = sampler.get_trace()  # dict[str, list[float]]
     if trace is not None and "sigma" in trace and "dual_inject_norm" in trace:
