@@ -6,6 +6,10 @@ This folder now contains two tuning paths:
   Preferred for strong GPUs. It evaluates many PDHG candidates in batched chunks
   inside one process, so the diffusion model, images, and measurements are loaded once.
 
+- `run_pdhg_exact_grid.py`
+  Faithful fallback. It launches one real `recover_inverse2.py` run per candidate,
+  so the ranking path matches the normal experiment path exactly.
+
 - `run_pdhg_tuning.py`
   Older staged fallback. It launches one Hydra run per candidate and is mainly
   useful when you want the original subprocess-style sweep behavior.
@@ -17,6 +21,12 @@ This folder now contains two tuning paths:
 
 - `pdhg_batched_grid.template.yaml`
   Batched search template aligned with the current `test2.sh` baseline.
+
+- `run_pdhg_exact_grid.py`
+  Exact subprocess-based grid runner.
+
+- `pdhg_exact_grid.template.yaml`
+  Exact search template aligned with the current `test2.sh` baseline.
 
 ## Batched Workflow
 
@@ -39,7 +49,33 @@ python tuning/run_pdhg_batched_grid.py --config tuning/pdhg_batched_grid.templat
    - `tuning_runs/.../leaderboard.csv`
    - `tuning_runs/.../leaderboard.json`
    - `tuning_runs/.../chunks/chunk_XXX.json`
+   - `tuning_runs/.../current_chunk.json`
    - `tuning_runs/.../progress.json`
+
+## Exact Workflow
+
+Use this when you want the candidate ranking to match the normal
+`recover_inverse2.py` path rather than the candidate-batched proxy.
+
+1. Edit `pdhg_exact_grid.template.yaml`.
+2. Dry-run the expansion:
+
+```bash
+python tuning/run_pdhg_exact_grid.py --config tuning/pdhg_exact_grid.template.yaml --dry-run
+```
+
+3. Launch the exact sweep:
+
+```bash
+python tuning/run_pdhg_exact_grid.py --config tuning/pdhg_exact_grid.template.yaml
+```
+
+4. Inspect the saved study:
+   - `tuning_runs/.../leaderboard.csv`
+   - `tuning_runs/.../leaderboard.json`
+   - `tuning_runs/.../progress.json`
+   - `tuning_runs/.../current_candidate.json`
+   - `tuning_runs/.../runs/candidate_XXX/launcher.log`
 
 ## Current Default Search Space
 
@@ -70,6 +106,9 @@ phase retrieval:
 
 Artifact-heavy save options remain disabled so the sweep stays light.
 
+The exact template uses the same baseline and search space, but it evaluates
+each candidate via a separate `recover_inverse2.py` subprocess.
+
 ## Chunk Size Guidance
 
 - Start conservatively if you do not yet know the GPU headroom.
@@ -81,13 +120,20 @@ On large GPUs, the main tuning control becomes chunk size rather than staging.
 ## Progress Tracking
 
 During a live batched sweep, the runner updates `progress.json` after each
-completed chunk. It includes:
+completed chunk and during the PDHG loop. It includes:
 
 - current status: `running`, `completed`, or `failed`
 - completed vs total chunks
 - completed vs total candidates
 - elapsed time and ETA
 - the current best candidate and score
+- current chunk iteration / chunk progress
+- current chunk candidate list in `current_chunk.json`
+
+The exact runner also writes:
+
+- current candidate metadata in `current_candidate.json`
+- partial `leaderboard.csv` / `leaderboard.json` after every finished candidate
 
 The Colab notebook includes cells to:
 

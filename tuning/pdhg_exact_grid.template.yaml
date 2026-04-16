@@ -1,0 +1,65 @@
+study:
+  name: pdhg_phase_retrieval_exact_grid
+  output_root: tuning_runs
+  result_root: results/tuning
+  hydra_root: outputs/tuning
+
+runner:
+  python_executable: python
+  entrypoint: recover_inverse2.py
+  config_name: default_ffhq.yaml
+  workdir: .
+
+scoring:
+  primary_metric: psnr
+  comparator: auto
+  aggregate: mean
+
+report:
+  top_k: 10
+
+base_overrides:
+  - sampler=edm_pdhg
+  - inverse_task=phase_retrieval
+  - name=PDHG_Exact_Tuning
+  - seed=99
+  - wandb=false
+  - save_samples=false
+  - save_traj=false
+  - save_traj_raw_data=false
+  - show_config=false
+  - total_images=10
+  - batch_size=10
+  - num_runs=1
+  - inverse_task.operator.sigma=0.05
+  - sampler.annealing_scheduler_config.num_steps=500
+  - inverse_task.admm_config.denoise.final_step=tweedie
+  - inverse_task.admm_config.max_iter=500
+  - inverse_task.admm_config.dys.gamma=0.0075
+  - inverse_task.admm_config.dys.lambda_schedule.activate=true
+  - inverse_task.admm_config.dys.lambda_schedule.start=1
+  - inverse_task.admm_config.dys.lambda_schedule.end=1
+  - inverse_task.admm_config.dys.lambda_schedule.warmup=0
+  - inverse_task.admm_config.denoise.lgvd.num_steps=0
+
+grid:
+  sampler.annealing_scheduler_config.sigma_max:
+    values:
+      - 20
+      - 27
+      - 30
+  sampler.annealing_scheduler_config.sigma_min:
+    values:
+      - 0.05
+      - 0.075
+      - 0.1
+  inverse_task.admm_config.pdhg.tau:
+    values:
+      - 0.005
+      - 0.0075
+      - 0.01
+  inverse_task.admm_config.pdhg.sigma_dual:
+    values:
+      - 800
+      - 1200
+      - 1600

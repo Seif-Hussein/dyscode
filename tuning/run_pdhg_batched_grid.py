@@ -35,6 +35,7 @@ class StudyPaths:
     chunks_root: Path
     config_snapshot_path: Path
     candidates_path: Path
+    current_chunk_path: Path
 
 
 def parse_args() -> argparse.Namespace:
@@ -143,6 +144,7 @@ def create_study_paths(cfg: dict[str, Any], config_path: Path) -> StudyPaths:
     leaderboard_json = root / "leaderboard.json"
     config_snapshot_path = root / "effective_base_config.yaml"
     candidates_path = root / "candidates.json"
+    current_chunk_path = root / "current_chunk.json"
 
     manifest = {
         "study_name": study_cfg["name"],
@@ -161,6 +163,7 @@ def create_study_paths(cfg: dict[str, Any], config_path: Path) -> StudyPaths:
         chunks_root=chunks_root,
         config_snapshot_path=config_snapshot_path,
         candidates_path=candidates_path,
+        current_chunk_path=current_chunk_path,
     )
 
 
@@ -195,6 +198,11 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_json(path: Path, payload: Any) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
 
 
 def build_sigma_schedule_tensor(
@@ -545,6 +553,17 @@ def main() -> None:
                     },
                 )
 
+            write_json(
+                study_paths.current_chunk_path,
+                {
+                    "chunk_index": chunk_index,
+                    "candidate_count": len(candidate_chunk),
+                    "candidates": candidate_chunk,
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                    "status": "running",
+                },
+            )
+
             samples = sampler.sample_hparam_candidates(
                 model=model,
                 ref_img=images,
@@ -586,10 +605,11 @@ def main() -> None:
                 "metrics": metric_results,
             }
             chunk_path = study_paths.chunks_root / f"chunk_{chunk_index:03d}.json"
-            with chunk_path.open("w", encoding="utf-8") as handle:
-                json.dump(chunk_payload, handle, indent=2)
+            write_json(chunk_path, chunk_payload)
 
             sorted_so_far = sort_rows(leaderboard_rows, scoring_cfg)
+            write_csv(study_paths.leaderboard_csv, sorted_so_far)
+            write_json(study_paths.leaderboard_json, sorted_so_far)
             completed_chunks = chunk_index + 1
             completed_candidates = min((chunk_index + 1) * chunk_size, len(candidates))
             elapsed = time.time() - started_at
@@ -629,11 +649,21 @@ def main() -> None:
                     "current_sigma_mean": None,
                 },
             )
+            write_json(
+                study_paths.current_chunk_path,
+                {
+                    "chunk_index": chunk_index,
+                    "candidate_count": len(candidate_chunk),
+                    "candidates": candidate_chunk,
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                    "status": "completed",
+                    "best_so_far": sorted_so_far[0] if sorted_so_far else None,
+                },
+            )
 
         sorted_rows = sort_rows(leaderboard_rows, scoring_cfg)
         write_csv(study_paths.leaderboard_csv, sorted_rows)
-        with study_paths.leaderboard_json.open("w", encoding="utf-8") as handle:
-            json.dump(sorted_rows, handle, indent=2)
+        write_json(study_paths.leaderboard_json, sorted_rows)
         update_progress(
             study_paths.progress_path,
             status="completed",
@@ -654,6 +684,16 @@ def main() -> None:
         )
     except Exception:
         sorted_so_far = sort_rows(leaderboard_rows, scoring_cfg) if leaderboard_rows else []
+        write_csv(study_paths.leaderboard_csv, sorted_so_far)
+        write_json(study_paths.leaderboard_json, sorted_so_far)
+        write_json(
+            study_paths.current_chunk_path,
+            {
+                "status": "failed",
+                "failed_at": datetime.now().isoformat(timespec="seconds"),
+                "best_so_far": sorted_so_far[0] if sorted_so_far else None,
+            },
+        )
         update_progress(
             study_paths.progress_path,
             status="failed",
