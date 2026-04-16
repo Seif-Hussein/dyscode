@@ -445,8 +445,7 @@ def main() -> None:
     torch.cuda.set_device(gpu_index)
     device = torch.device(f"cuda:{gpu_index}")
 
-    dataset_cfg = dict(resolved_cfg["data"])
-    dataset = get_dataset(**dataset_cfg)
+    dataset = get_dataset(**experiment_cfg.data)
     num_images = min(int(resolved_cfg["total_images"]), len(dataset))
     if num_images <= 0:
         raise RuntimeError("Dataset is empty after applying the configured slice.")
@@ -454,12 +453,11 @@ def main() -> None:
     dataloader = DataLoader(dataset, batch_size=num_images, shuffle=False)
     images = next(iter(dataloader)).to(device)
 
-    operator_cfg = dict(resolved_cfg["inverse_task"]["operator"])
-    operator = get_operator(**operator_cfg)
+    operator = get_operator(**experiment_cfg.inverse_task.operator)
     measurements = operator.measure(images)
 
-    model = get_model(**resolved_cfg["model"])
-    sampler = get_sampler(**resolved_cfg["sampler"], **resolved_cfg["inverse_task"])
+    model = get_model(**experiment_cfg.model)
+    sampler = get_sampler(**experiment_cfg.sampler, **experiment_cfg.inverse_task)
     if not isinstance(sampler, PDHG):
         raise TypeError(f"Expected PDHG sampler, got {type(sampler).__name__}")
 
