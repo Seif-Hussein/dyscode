@@ -128,6 +128,24 @@ class PDHG(nn.Module):
     def _init_trace(self):
         self.trace = {}
 
+    @staticmethod
+    def _param_vector(value, batch_size: int, device, dtype=torch.float32) -> torch.Tensor:
+        if torch.is_tensor(value):
+            vec = value.to(device=device, dtype=dtype).reshape(-1)
+        else:
+            vec = torch.as_tensor(value, device=device, dtype=dtype).reshape(-1)
+
+        if vec.numel() == 1:
+            vec = vec.expand(batch_size)
+        elif vec.numel() != batch_size:
+            raise ValueError(f"Expected 1 or {batch_size} values, got {vec.numel()}")
+        return vec
+
+    @classmethod
+    def _param_view(cls, value, target: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
+        vec = cls._param_vector(value, target.shape[0], target.device, dtype=dtype)
+        return vec.reshape((-1,) + (1,) * (target.dim() - 1))
+
     def _trace_add_value(self, key: str, value):
         if self.trace is None:
             return
@@ -245,21 +263,25 @@ class PDHG(nn.Module):
     # -------------------------
     def _dual_update_linear_mse(self, p: torch.Tensor, Ax_bar: torch.Tensor, y: torch.Tensor,
                                sigma_dual: float, sigma_n: float):
-        q = p + sigma_dual * Ax_bar
-        denom = 1.0 + sigma_dual * (sigma_n ** 2)
+        sigma_dual_view = self._param_view(sigma_dual, Ax_bar, dtype=Ax_bar.dtype)
+        sigma_n_view = self._param_view(sigma_n, Ax_bar, dtype=Ax_bar.dtype)
+        q = p + sigma_dual_view * Ax_bar
+        denom = 1.0 + sigma_dual_view * (sigma_n_view ** 2)
         return (q - sigma_dual * y) / denom
 
     def _dual_update_phase_retrieval(self, p: torch.Tensor, u_bar: torch.Tensor, y_amp: torch.Tensor,
                                      sigma_dual: float, sigma_n: float, eps: float = 1e-12):
-        q = p + sigma_dual * u_bar
-        w = q / sigma_dual
+        sigma_dual_view = self._param_view(sigma_dual, u_bar, dtype=u_bar.real.dtype)
+        sigma_n_view = self._param_view(sigma_n, u_bar, dtype=u_bar.real.dtype)
+        q = p + sigma_dual_view * u_bar
+        w = q / sigma_dual_view
 
         r0 = w.abs()
-        a = sigma_dual * (sigma_n ** 2)
+        a = sigma_dual_view * (sigma_n_view ** 2)
         r_star = (a * r0 + y_amp) / (a + 1.0)
 
         w_prox = w * (r_star / (r0 + eps))
-        return q - sigma_dual * w_prox
+        return q - sigma_dual_view * w_prox
 
     def _dual_update_phase_retrieval_diag(self, p: torch.Tensor, u_bar: torch.Tensor, y_amp: torch.Tensor,
                                           sigma_dual: float, sigma_n: float, eps: float = 1e-12):
@@ -268,15 +290,17 @@ class PDHG(nn.Module):
           - prox_move: ||w_prox - w|| / sqrt(n)
           - prox_radial_resid: mean(| |w_prox| - r_star |)  (should be ~0)
         """
-        q = p + sigma_dual * u_bar
-        w = q / sigma_dual
+        sigma_dual_view = self._param_view(sigma_dual, u_bar, dtype=u_bar.real.dtype)
+        sigma_n_view = self._param_view(sigma_n, u_bar, dtype=u_bar.real.dtype)
+        q = p + sigma_dual_view * u_bar
+        w = q / sigma_dual_view
 
         r0 = w.abs()
-        a = sigma_dual * (sigma_n ** 2)
+        a = sigma_dual_view * (sigma_n_view ** 2)
         r_star = (a * r0 + y_amp) / (a + 1.0)
 
         w_prox = w * (r_star / (r0 + eps))
-        p_new = q - sigma_dual * w_prox
+        p_new = q - sigma_dual_view * w_prox
 
         # diagnostics
         w_flat = w.reshape(w.shape[0], -1) if w.dim() >= 3 else w.flatten().unsqueeze(0)
@@ -315,35 +339,40 @@ class PDHG(nn.Module):
         denoise_config = self.admm_config.denoise
         with torch.no_grad():
             noisy_im = z_in.clone()
+            sigma_batch = self._param_vector(sigma, noisy_im.shape[0], noisy_im.device, dtype=noisy_im.dtype)
+            sigma_view = sigma_batch.reshape((-1,) + (1,) * (noisy_im.dim() - 1))
 
             if prior_use_type not in ["denoise"]:
                 raise Exception(f"Prior type {prior_use_type} not supported!!!")
 
             ac_noise = bool(getattr(denoise_config, "ac_noise", True))
-            if ac_noise and sigma > 0:
-                #print("hej")
-                forward_z = noisy_im + torch.randn_like(noisy_im) * sigma
+            if ac_noise:
+                forward_z = noisy_im + torch.randn_like(noisy_im) * sigma_view
             else:
-                #print("hej")
                 forward_z = noisy_im
 
             lgvd_z = forward_z.clone()
-            lr = denoise_config.lgvd.lr * sigma
+            lr = denoise_config.lgvd.lr * sigma_view
 
             num_steps = int(getattr(denoise_config.lgvd, "num_steps", 0))
             reg_factor = float(getattr(denoise_config.lgvd, "reg_factor", 0.0))
             drift_clip = float(getattr(denoise_config.lgvd, "drift_clip", 10.0))
             noise_scale = float(getattr(denoise_config.lgvd, "noise_scale", 1.0))
+            drift_scale = torch.clamp(sigma_batch * reg_factor, max=drift_clip).reshape(
+                (-1,) + (1,) * (noisy_im.dim() - 1)
+            )
 
             for _ in range(num_steps):
-                score_val = model.score(lgvd_z, sigma)
+                score_val = model.score(lgvd_z, sigma_batch)
                 diff_val = (forward_z - lgvd_z + d_k)
-                drift = lr * min(sigma * reg_factor, drift_clip) * diff_val
+                drift = lr * drift_scale * diff_val
                 lgvd_z += lr * score_val + drift + noise_scale * (2 * lr) ** 0.5 * torch.randn_like(noisy_im)
 
             if denoise_config.final_step == 'tweedie':
-                z = model.tweedie(lgvd_z, sigma)
+                z = model.tweedie(lgvd_z, sigma_batch)
             elif denoise_config.final_step == 'ode':
+                if sigma_batch.numel() != 1 and not torch.allclose(sigma_batch, sigma_batch[0].expand_as(sigma_batch)):
+                    raise NotImplementedError("Per-sample sigma schedules are only supported for final_step='tweedie'.")
                 diffusion_scheduler = Scheduler(**self.diffusion_scheduler_config, sigma_max=sigma)
                 sampler = DiffusionSampler(diffusion_scheduler)
                 z = sampler.sample(model, lgvd_z, SDE=False, verbose=False)
@@ -375,6 +404,112 @@ class PDHG(nn.Module):
                 raise Exception(f"Final step {denoise_config.final_step} not supported!!!")
 
             return z
+
+    def sample_hparam_candidates(self, model, ref_img, operator, measurement,
+                                 sigma_schedule_by_candidate: torch.Tensor,
+                                 tau_by_candidate: torch.Tensor,
+                                 sigma_dual_by_candidate: torch.Tensor,
+                                 start_triplet: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None):
+        """
+        Evaluate multiple PDHG hyperparameter candidates in one batched run.
+
+        This path is intentionally lightweight for tuning:
+        - no trajectory recording
+        - no wandb logging
+        - currently restricted to phase retrieval, which is the tuning target
+        - intended for final_step='tweedie' where per-sample sigma is supported
+
+        Args:
+            sigma_schedule_by_candidate: [C, K] tensor of denoiser sigmas.
+            tau_by_candidate: [C] tensor.
+            sigma_dual_by_candidate: [C] tensor.
+            start_triplet: Optional `(x0, z0, y0)` tuple generated from `get_start(ref_img)`.
+                When provided, the same initialization is reused across candidate chunks.
+
+        Returns:
+            Tensor of shape [C, B, C_img, H, W].
+        """
+        mode = self._mode(operator, measurement)
+        if mode != "phase_retrieval":
+            raise NotImplementedError("Batched candidate evaluation is currently implemented for phase_retrieval only.")
+
+        if self.admm_config.denoise.final_step != "tweedie":
+            raise NotImplementedError("Batched candidate evaluation currently requires final_step='tweedie'.")
+
+        num_candidates, max_iter = sigma_schedule_by_candidate.shape
+        if max_iter < int(self.admm_config.max_iter):
+            raise ValueError("sigma_schedule_by_candidate must have at least max_iter columns.")
+
+        batch_size = ref_img.shape[0]
+        total_batch = num_candidates * batch_size
+        device = ref_img.device
+
+        tau_batch = self._param_vector(tau_by_candidate, num_candidates, device=device, dtype=ref_img.dtype)
+        sigma_dual_batch = self._param_vector(
+            sigma_dual_by_candidate, num_candidates, device=device, dtype=ref_img.dtype
+        )
+        sigma_n_batch = torch.full((num_candidates,), float(getattr(operator, "sigma", 0.05)),
+                                   device=device, dtype=ref_img.dtype)
+
+        ref_rep = ref_img.repeat((num_candidates, 1, 1, 1))
+        if not torch.is_tensor(measurement):
+            raise NotImplementedError("Batched candidate evaluation expects tensor measurements.")
+        measurement_rep = measurement.repeat((num_candidates, 1, 1, 1))
+
+        if start_triplet is None:
+            base_x0, base_z0, base_y0 = self.get_start(ref_img)
+        else:
+            if len(start_triplet) != 3:
+                raise ValueError("start_triplet must contain exactly three tensors: (x0, z0, y0).")
+            base_x0, base_z0, base_y0 = [tensor.to(device=device, dtype=ref_img.dtype) for tensor in start_triplet]
+
+        x_k = base_y0.repeat((num_candidates, 1, 1, 1))
+        z_k = base_z0.repeat((num_candidates, 1, 1, 1))
+        y_k = base_y0.repeat((num_candidates, 1, 1, 1))
+        x_bar = x_k.clone()
+
+        with torch.no_grad():
+            p_k = torch.zeros_like(operator.forward_complex(self._to_01(x_bar)))
+
+        tau_batch_expanded = tau_batch.repeat_interleave(batch_size)
+        sigma_dual_batch_expanded = sigma_dual_batch.repeat_interleave(batch_size)
+        sigma_n_batch_expanded = sigma_n_batch.repeat_interleave(batch_size)
+        theta_schedule = self.theta_schedule
+
+        for step in range(int(self.admm_config.max_iter)):
+            sigma_step = sigma_schedule_by_candidate[:, step].to(device=device, dtype=ref_img.dtype)
+            sigma_step_expanded = sigma_step.repeat_interleave(batch_size)
+            theta = 0.0 if self.force_theta_zero else float(theta_schedule[min(step, len(theta_schedule) - 1)])
+
+            u_bar = operator.forward_complex(self._to_01(x_bar))
+            p_k = self._dual_update_phase_retrieval(
+                p=p_k,
+                u_bar=u_bar,
+                y_amp=measurement_rep,
+                sigma_dual=sigma_dual_batch_expanded,
+                sigma_n=sigma_n_batch_expanded,
+            )
+
+            kstar_p_x01 = operator.adjoint_complex(p_k, out_hw=(x_k.shape[-2], x_k.shape[-1]))
+            at_p = 0.5 * kstar_p_x01
+            tau_view = self._param_view(tau_batch_expanded, x_k, dtype=x_k.dtype)
+            z_k = x_k - tau_view * at_p
+
+            x_new = self.optimize_denoising(
+                z_in=z_k,
+                model=model,
+                d_k=torch.zeros_like(z_k),
+                sigma=sigma_step_expanded,
+                prior_use_type=self.admm_config.denoise.type,
+                wandb=False,
+            )
+            x_new = self._proj(x_new)
+
+            x_bar = x_new + theta * (x_new - x_k)
+            x_k = x_new
+            y_k = x_k
+
+        return x_k.view(num_candidates, batch_size, *x_k.shape[1:])
 
     # -------------------------
     # Norm utilities
