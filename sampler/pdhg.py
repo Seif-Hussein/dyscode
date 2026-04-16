@@ -409,7 +409,9 @@ class PDHG(nn.Module):
                                  sigma_schedule_by_candidate: torch.Tensor,
                                  tau_by_candidate: torch.Tensor,
                                  sigma_dual_by_candidate: torch.Tensor,
-                                 start_triplet: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None):
+                                 start_triplet: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+                                 progress_callback=None,
+                                 progress_every: int | None = None):
         """
         Evaluate multiple PDHG hyperparameter candidates in one batched run.
 
@@ -425,6 +427,9 @@ class PDHG(nn.Module):
             sigma_dual_by_candidate: [C] tensor.
             start_triplet: Optional `(x0, z0, y0)` tuple generated from `get_start(ref_img)`.
                 When provided, the same initialization is reused across candidate chunks.
+            progress_callback: Optional callable invoked during the PDHG loop with keyword args
+                `step`, `num_steps`, and `sigma_mean`.
+            progress_every: How often to invoke `progress_callback` in iterations. Defaults to 0/disabled.
 
         Returns:
             Tensor of shape [C, B, C_img, H, W].
@@ -475,8 +480,10 @@ class PDHG(nn.Module):
         sigma_dual_batch_expanded = sigma_dual_batch.repeat_interleave(batch_size)
         sigma_n_batch_expanded = sigma_n_batch.repeat_interleave(batch_size)
         theta_schedule = self.theta_schedule
+        progress_every = int(progress_every or 0)
+        total_steps = int(self.admm_config.max_iter)
 
-        for step in range(int(self.admm_config.max_iter)):
+        for step in range(total_steps):
             sigma_step = sigma_schedule_by_candidate[:, step].to(device=device, dtype=ref_img.dtype)
             sigma_step_expanded = sigma_step.repeat_interleave(batch_size)
             theta = 0.0 if self.force_theta_zero else float(theta_schedule[min(step, len(theta_schedule) - 1)])
@@ -508,6 +515,20 @@ class PDHG(nn.Module):
             x_bar = x_new + theta * (x_new - x_k)
             x_k = x_new
             y_k = x_k
+
+            should_report = (
+                progress_callback is not None and (
+                    step == 0
+                    or step == total_steps - 1
+                    or (progress_every > 0 and (step + 1) % progress_every == 0)
+                )
+            )
+            if should_report:
+                progress_callback(
+                    step=step + 1,
+                    num_steps=total_steps,
+                    sigma_mean=float(sigma_step.mean().detach().cpu()),
+                )
 
         return x_k.view(num_candidates, batch_size, *x_k.shape[1:])
 

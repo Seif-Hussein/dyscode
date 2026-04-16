@@ -15,6 +15,7 @@ report:
 
 batched:
   candidate_chunk_size: 6
+  progress_update_every: 25
 
 base_overrides:
   - sampler=edm_pdhg

@@ -340,6 +340,7 @@ def update_progress(
     started_at: float,
     current_chunk_index: int | None = None,
     rows: list[dict[str, Any]] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     elapsed_seconds = max(0.0, time.time() - started_at)
     avg_chunk_seconds = elapsed_seconds / completed_chunks if completed_chunks > 0 else None
@@ -369,6 +370,9 @@ def update_progress(
             "sigma_dual": best_row.get("inverse_task.admm_config.pdhg.sigma_dual"),
         }
 
+    if extra:
+        payload.update(extra)
+
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
 
@@ -387,6 +391,7 @@ def main() -> None:
     chunk_size = int(args.chunk_size or cfg["batched"]["candidate_chunk_size"])
     if chunk_size <= 0:
         raise ValueError("candidate_chunk_size must be positive")
+    progress_update_every = int(cfg.get("batched", {}).get("progress_update_every", 25))
 
     study_paths = create_study_paths(cfg, config_path)
     with study_paths.candidates_path.open("w", encoding="utf-8") as handle:
@@ -516,6 +521,30 @@ def main() -> None:
                 dtype=dtype,
             )
 
+            def on_chunk_progress(*, step: int, num_steps: int, sigma_mean: float) -> None:
+                sorted_so_far = sort_rows(leaderboard_rows, scoring_cfg) if leaderboard_rows else []
+                completed_candidates = min(chunk_index * chunk_size, len(candidates))
+                completed_chunks = chunk_index
+                chunk_progress = step / max(1, num_steps)
+                update_progress(
+                    study_paths.progress_path,
+                    status="running",
+                    total_candidates=len(candidates),
+                    completed_candidates=completed_candidates,
+                    total_chunks=total_chunks,
+                    completed_chunks=completed_chunks,
+                    current_chunk_index=chunk_index,
+                    started_at=started_at,
+                    rows=sorted_so_far,
+                    extra={
+                        "current_chunk_iteration": step,
+                        "current_chunk_total_iterations": num_steps,
+                        "current_chunk_candidate_count": len(candidate_chunk),
+                        "current_chunk_progress": chunk_progress,
+                        "current_sigma_mean": sigma_mean,
+                    },
+                )
+
             samples = sampler.sample_hparam_candidates(
                 model=model,
                 ref_img=images,
@@ -525,6 +554,8 @@ def main() -> None:
                 tau_by_candidate=tau_values,
                 sigma_dual_by_candidate=sigma_dual_values,
                 start_triplet=base_start_triplet,
+                progress_callback=on_chunk_progress,
+                progress_every=progress_update_every,
             )
 
             metric_results = evaluate_candidate_metrics(
@@ -590,6 +621,13 @@ def main() -> None:
                 current_chunk_index=chunk_index,
                 started_at=started_at,
                 rows=sorted_so_far,
+                extra={
+                    "current_chunk_iteration": max_iter,
+                    "current_chunk_total_iterations": max_iter,
+                    "current_chunk_candidate_count": len(candidate_chunk),
+                    "current_chunk_progress": 1.0,
+                    "current_sigma_mean": None,
+                },
             )
 
         sorted_rows = sort_rows(leaderboard_rows, scoring_cfg)
@@ -606,6 +644,13 @@ def main() -> None:
             current_chunk_index=(total_chunks - 1) if total_chunks > 0 else None,
             started_at=started_at,
             rows=sorted_rows,
+            extra={
+                "current_chunk_iteration": max_iter,
+                "current_chunk_total_iterations": max_iter,
+                "current_chunk_candidate_count": 0,
+                "current_chunk_progress": 1.0,
+                "current_sigma_mean": None,
+            },
         )
     except Exception:
         sorted_so_far = sort_rows(leaderboard_rows, scoring_cfg) if leaderboard_rows else []
@@ -619,6 +664,13 @@ def main() -> None:
             current_chunk_index=None,
             started_at=started_at,
             rows=sorted_so_far,
+            extra={
+                "current_chunk_iteration": None,
+                "current_chunk_total_iterations": max_iter,
+                "current_chunk_candidate_count": 0,
+                "current_chunk_progress": None,
+                "current_sigma_mean": None,
+            },
         )
         raise
 
