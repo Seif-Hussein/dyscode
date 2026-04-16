@@ -11,11 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import hydra
-import torch
 import yaml
-from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -169,6 +165,8 @@ def create_study_paths(cfg: dict[str, Any], config_path: Path) -> StudyPaths:
 
 
 def compose_base_config(repo_root: Path, runner_cfg: dict[str, Any], overrides: list[str]):
+    import hydra
+
     config_name = runner_cfg.get("config_name", "default_ffhq.yaml")
     if config_name.endswith(".yaml"):
         config_name = Path(config_name).stem
@@ -203,9 +201,10 @@ def build_sigma_schedule_tensor(
     annealing_cfg: dict[str, Any],
     candidates: list[dict[str, Any]],
     max_iter: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
+    device,
+    dtype,
+):
+    import torch
     from utils.diffusion import Scheduler
 
     schedules = []
@@ -230,21 +229,24 @@ def tensorize_candidate_values(
     candidates: list[dict[str, Any]],
     resolved_cfg: dict[str, Any],
     key: str,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
+    device,
+    dtype,
+):
+    import torch
+
     default_value = float(lookup_dotted(resolved_cfg, key))
     values = [float(candidate.get(key, default_value)) for candidate in candidates]
     return torch.as_tensor(values, device=device, dtype=dtype)
 
 
-@torch.no_grad()
 def evaluate_candidate_metrics(
     eval_fns: dict[str, Any],
-    gt: torch.Tensor,
-    measurement: torch.Tensor,
-    samples: torch.Tensor,
+    gt,
+    measurement,
+    samples,
 ) -> dict[str, dict[str, list[float] | list[list[float]]]]:
+    import torch
+
     num_candidates, batch_size = samples.shape[:2]
     gt_flat = gt.unsqueeze(0).expand(num_candidates, *gt.shape).reshape(num_candidates * batch_size, *gt.shape[1:])
     sample_flat = samples.reshape(num_candidates * batch_size, *samples.shape[2:])
@@ -417,6 +419,10 @@ def main() -> None:
     runner_cfg = cfg["runner"]
     base_overrides = list(cfg.get("base_overrides", []))
     experiment_cfg = compose_base_config(repo_root, runner_cfg, base_overrides)
+    from omegaconf import OmegaConf
+    import torch
+    from torch.utils.data import DataLoader
+
     resolved_cfg = OmegaConf.to_container(experiment_cfg, resolve=True)
     if not isinstance(resolved_cfg, dict):
         raise ValueError("Resolved Hydra config is not a mapping")
