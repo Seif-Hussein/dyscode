@@ -50,6 +50,9 @@ python tuning/run_pdhg_batched_grid.py --config tuning/pdhg_batched_grid.templat
    - `tuning_runs/.../leaderboard.json`
    - `tuning_runs/.../chunks/chunk_XXX.json`
    - `tuning_runs/.../current_chunk.json`
+   - `tuning_runs/.../best_preview.png`
+   - `tuning_runs/.../best_samples.pt`
+   - `tuning_runs/.../best_candidate.json`
    - `tuning_runs/.../progress.json`
 
 ## Exact Workflow
@@ -134,6 +137,12 @@ The exact runner also writes:
 
 - current candidate metadata in `current_candidate.json`
 - partial `leaderboard.csv` / `leaderboard.json` after every finished candidate
+
+The batched runner also keeps artifacts for the best-so-far candidate:
+
+- `best_preview.png`
+- `best_samples.pt`
+- `best_candidate.json`
 
 The Colab notebook includes cells to:
 

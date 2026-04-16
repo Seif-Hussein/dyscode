@@ -36,6 +36,9 @@ class StudyPaths:
     config_snapshot_path: Path
     candidates_path: Path
     current_chunk_path: Path
+    best_preview_path: Path
+    best_samples_path: Path
+    best_candidate_path: Path
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,6 +148,9 @@ def create_study_paths(cfg: dict[str, Any], config_path: Path) -> StudyPaths:
     config_snapshot_path = root / "effective_base_config.yaml"
     candidates_path = root / "candidates.json"
     current_chunk_path = root / "current_chunk.json"
+    best_preview_path = root / "best_preview.png"
+    best_samples_path = root / "best_samples.pt"
+    best_candidate_path = root / "best_candidate.json"
 
     manifest = {
         "study_name": study_cfg["name"],
@@ -164,6 +170,9 @@ def create_study_paths(cfg: dict[str, Any], config_path: Path) -> StudyPaths:
         config_snapshot_path=config_snapshot_path,
         candidates_path=candidates_path,
         current_chunk_path=current_chunk_path,
+        best_preview_path=best_preview_path,
+        best_samples_path=best_samples_path,
+        best_candidate_path=best_candidate_path,
     )
 
 
@@ -203,6 +212,51 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def write_json(path: Path, payload: Any) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+
+
+def save_best_candidate_artifacts(
+    study_paths: StudyPaths,
+    *,
+    row: dict[str, Any],
+    sample_batch,
+    gt_batch=None,
+) -> None:
+    import torch
+    from torchvision.utils import make_grid
+    from PIL import Image
+
+    sample_batch = sample_batch.detach().cpu()
+    torch.save(sample_batch, study_paths.best_samples_path)
+
+    preview_batch = sample_batch
+    nrow = min(int(sample_batch.shape[0]), 10)
+    if gt_batch is not None:
+        gt_batch = gt_batch.detach().cpu()
+        preview_batch = torch.cat([gt_batch, sample_batch], dim=0)
+        nrow = int(gt_batch.shape[0])
+
+    preview_batch = ((preview_batch.clamp(-1, 1) + 1.0) * 0.5).clamp(0, 1)
+    grid = make_grid(preview_batch, nrow=max(1, nrow), padding=2)
+    grid_uint8 = (
+        grid.mul(255.0)
+        .add_(0.5)
+        .clamp_(0, 255)
+        .permute(1, 2, 0)
+        .to(torch.uint8)
+        .numpy()
+    )
+    Image.fromarray(grid_uint8).save(study_paths.best_preview_path)
+
+    write_json(
+        study_paths.best_candidate_path,
+        {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "row": row,
+            "best_preview_path": str(study_paths.best_preview_path.as_posix()),
+            "best_samples_path": str(study_paths.best_samples_path.as_posix()),
+            "num_images": int(sample_batch.shape[0]),
+        },
+    )
 
 
 def build_sigma_schedule_tensor(
@@ -608,6 +662,18 @@ def main() -> None:
             write_json(chunk_path, chunk_payload)
 
             sorted_so_far = sort_rows(leaderboard_rows, scoring_cfg)
+            if sorted_so_far:
+                best = sorted_so_far[0]
+                current_chunk_start = chunk_index * chunk_size
+                current_chunk_end = current_chunk_start + len(candidate_chunk)
+                if current_chunk_start <= int(best["candidate_index"]) < current_chunk_end:
+                    best_local_idx = int(best["candidate_index"]) - current_chunk_start
+                    save_best_candidate_artifacts(
+                        study_paths,
+                        row=best,
+                        sample_batch=samples[best_local_idx],
+                        gt_batch=images,
+                    )
             write_csv(study_paths.leaderboard_csv, sorted_so_far)
             write_json(study_paths.leaderboard_json, sorted_so_far)
             completed_chunks = chunk_index + 1
