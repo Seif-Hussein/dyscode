@@ -5,6 +5,8 @@ from .downsample import DownSampling
 from .inpainting import Inpainting
 from .phaseretrieval import PhaseRetrieval
 from .compressionquantization import CompressionQuantization
+from .transmission_ct import TransmissionCT
 
 __all__ = [get_operator, GaussianBlur, MotionBlur, HighDynamicRange,
-           DownSampling, Inpainting, PhaseRetrieval, CompressionQuantization]
+           DownSampling, Inpainting, PhaseRetrieval, CompressionQuantization,
+           TransmissionCT]

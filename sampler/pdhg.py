@@ -6,6 +6,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
+from scipy.special import lambertw
 
 from utils.diffusion import Scheduler, DiffusionSampler
 from utils.logging import Trajectory
@@ -222,6 +223,11 @@ class PDHG(nn.Module):
                 raise RuntimeError("phase_retrieval measurement must be a tensor amplitude.")
             return "phase_retrieval"
 
+        if name == "transmission_ct":
+            if not torch.is_tensor(measurement):
+                raise RuntimeError("transmission_ct measurement must be a tensor of Poisson counts.")
+            return "transmission_ct"
+
         if name in self.SUPPORTED_LINEAR_NAMES:
             if not torch.is_tensor(measurement):
                 raise RuntimeError(f"{name} measurement must be a tensor for MSE loss.")
@@ -311,6 +317,43 @@ class PDHG(nn.Module):
         prox_radial_resid = float((w_prox.abs() - r_star).abs().mean().detach())
 
         return p_new, prox_move, prox_radial_resid
+
+    @staticmethod
+    def _lambertw_principal(x: torch.Tensor) -> torch.Tensor:
+        x_cpu = x.detach().to(device='cpu', dtype=torch.float64).numpy()
+        w_cpu = lambertw(x_cpu, k=0).real
+        return torch.from_numpy(w_cpu).to(device=x.device, dtype=x.dtype)
+
+    def _prox_transmission_ct(self, w: torch.Tensor, y_counts: torch.Tensor,
+                              sigma_dual: float, operator, eps: float = 1e-12) -> torch.Tensor:
+        sigma_view = self._param_view(sigma_dual, w, dtype=w.dtype)
+        eta = float(getattr(operator, "eta", 1.0))
+        eta_tensor = torch.as_tensor(eta, device=w.device, dtype=w.dtype)
+        i0 = operator.incident_counts(w).to(device=w.device, dtype=w.dtype)
+        arg = (eta_tensor * i0 / sigma_view.clamp_min(eps)) * torch.exp(
+            (-w + (eta_tensor * y_counts) / sigma_view).clamp(min=-80.0, max=80.0)
+        )
+        arg = arg.clamp_min(0.0)
+        return w - (eta_tensor * y_counts) / sigma_view + self._lambertw_principal(arg)
+
+    def _dual_update_transmission_ct_diag(self, p: torch.Tensor, z_bar: torch.Tensor, y_counts: torch.Tensor,
+                                          sigma_dual: float, operator, eps: float = 1e-12):
+        sigma_view = self._param_view(sigma_dual, z_bar, dtype=z_bar.dtype)
+        q = p + sigma_view * z_bar
+        w = q / sigma_view
+        z_prox = self._prox_transmission_ct(w=w, y_counts=y_counts, sigma_dual=sigma_dual, operator=operator, eps=eps)
+        p_new = q - sigma_view * z_prox
+
+        wf = w.reshape(w.shape[0], -1)
+        zf = z_prox.reshape(z_prox.shape[0], -1)
+        n_per = zf.shape[1]
+        prox_move = float((zf - wf).norm(dim=1).mean().detach() / math.sqrt(n_per))
+
+        eta = float(getattr(operator, "eta", 1.0))
+        i0 = operator.incident_counts(z_prox).to(device=z_prox.device, dtype=z_prox.dtype)
+        residual = sigma_view * (z_prox - w) + eta * (y_counts - i0 * torch.exp(-z_prox))
+        prox_opt_resid = float(residual.reshape(residual.shape[0], -1).norm(dim=1).mean().detach() / math.sqrt(n_per))
+        return p_new, prox_move, prox_opt_resid
     
     def phase_only_ac(self,operator, z_m11, sigma_phase):
         # z_m11: [B,C,H,W] in [-1,1]
@@ -418,7 +461,6 @@ class PDHG(nn.Module):
         This path is intentionally lightweight for tuning:
         - no trajectory recording
         - no wandb logging
-        - currently restricted to phase retrieval, which is the tuning target
         - intended for final_step='tweedie' where per-sample sigma is supported
 
         Args:
@@ -435,8 +477,11 @@ class PDHG(nn.Module):
             Tensor of shape [C, B, C_img, H, W].
         """
         mode = self._mode(operator, measurement)
-        if mode != "phase_retrieval":
-            raise NotImplementedError("Batched candidate evaluation is currently implemented for phase_retrieval only.")
+        if mode not in {"phase_retrieval", "transmission_ct"}:
+            raise NotImplementedError(
+                "Batched candidate evaluation is currently implemented for "
+                "phase_retrieval and transmission_ct only."
+            )
 
         if self.admm_config.denoise.final_step != "tweedie":
             raise NotImplementedError("Batched candidate evaluation currently requires final_step='tweedie'.")
@@ -461,20 +506,32 @@ class PDHG(nn.Module):
             raise NotImplementedError("Batched candidate evaluation expects tensor measurements.")
         measurement_rep = measurement.repeat((num_candidates, 1, 1, 1))
 
-        if start_triplet is None:
-            base_x0, base_z0, base_y0 = self.get_start(ref_img)
+        if mode == "transmission_ct":
+            # Mirror the main PDHG path: zero attenuation corresponds to x = -1
+            # under the operator's internal mu(x) mapping.
+            x_k = -torch.ones_like(ref_rep)
+            z_k = -torch.ones_like(ref_rep)
+            y_k = -torch.ones_like(ref_rep)
+            x_bar = x_k.clone()
+            with torch.no_grad():
+                p_k = torch.zeros_like(operator(x_bar))
         else:
-            if len(start_triplet) != 3:
-                raise ValueError("start_triplet must contain exactly three tensors: (x0, z0, y0).")
-            base_x0, base_z0, base_y0 = [tensor.to(device=device, dtype=ref_img.dtype) for tensor in start_triplet]
+            if start_triplet is None:
+                base_x0, base_z0, base_y0 = self.get_start(ref_img)
+            else:
+                if len(start_triplet) != 3:
+                    raise ValueError("start_triplet must contain exactly three tensors: (x0, z0, y0).")
+                base_x0, base_z0, base_y0 = [
+                    tensor.to(device=device, dtype=ref_img.dtype) for tensor in start_triplet
+                ]
 
-        x_k = base_y0.repeat((num_candidates, 1, 1, 1))
-        z_k = base_z0.repeat((num_candidates, 1, 1, 1))
-        y_k = base_y0.repeat((num_candidates, 1, 1, 1))
-        x_bar = x_k.clone()
+            x_k = base_y0.repeat((num_candidates, 1, 1, 1))
+            z_k = base_z0.repeat((num_candidates, 1, 1, 1))
+            y_k = base_y0.repeat((num_candidates, 1, 1, 1))
+            x_bar = x_k.clone()
 
-        with torch.no_grad():
-            p_k = torch.zeros_like(operator.forward_complex(self._to_01(x_bar)))
+            with torch.no_grad():
+                p_k = torch.zeros_like(operator.forward_complex(self._to_01(x_bar)))
 
         tau_batch_expanded = tau_batch.repeat_interleave(batch_size)
         sigma_dual_batch_expanded = sigma_dual_batch.repeat_interleave(batch_size)
@@ -488,17 +545,34 @@ class PDHG(nn.Module):
             sigma_step_expanded = sigma_step.repeat_interleave(batch_size)
             theta = 0.0 if self.force_theta_zero else float(theta_schedule[min(step, len(theta_schedule) - 1)])
 
-            u_bar = operator.forward_complex(self._to_01(x_bar))
-            p_k = self._dual_update_phase_retrieval(
-                p=p_k,
-                u_bar=u_bar,
-                y_amp=measurement_rep,
-                sigma_dual=sigma_dual_batch_expanded,
-                sigma_n=sigma_n_batch_expanded,
-            )
+            if mode == "phase_retrieval":
+                u_bar = operator.forward_complex(self._to_01(x_bar))
+                p_k = self._dual_update_phase_retrieval(
+                    p=p_k,
+                    u_bar=u_bar,
+                    y_amp=measurement_rep,
+                    sigma_dual=sigma_dual_batch_expanded,
+                    sigma_n=sigma_n_batch_expanded,
+                )
 
-            kstar_p_x01 = operator.adjoint_complex(p_k, out_hw=(x_k.shape[-2], x_k.shape[-1]))
-            at_p = 0.5 * kstar_p_x01
+                kstar_p_x01 = operator.adjoint_complex(p_k, out_hw=(x_k.shape[-2], x_k.shape[-1]))
+                at_p = 0.5 * kstar_p_x01
+            else:
+                z_bar = operator(x_bar)
+                sigma_dual_view = self._param_view(
+                    sigma_dual_batch_expanded, z_bar, dtype=z_bar.dtype
+                )
+                q = p_k + sigma_dual_view * z_bar
+                w = q / sigma_dual_view
+                z_prox = self._prox_transmission_ct(
+                    w=w,
+                    y_counts=measurement_rep,
+                    sigma_dual=sigma_dual_batch_expanded,
+                    operator=operator,
+                )
+                p_k = q - sigma_dual_view * z_prox
+                at_p = self._AT_autograd(operator, x_k, p_k)
+
             tau_view = self._param_view(tau_batch_expanded, x_k, dtype=x_k.dtype)
             z_k = x_k - tau_view * at_p
 
@@ -587,16 +661,22 @@ class PDHG(nn.Module):
             return float(df.norm(dim=1).mean().detach() / (max(sigma, eps) * math.sqrt(d)))
         
     @staticmethod
-    def _f_value(mode: str, u, y_meas, sigma_n: float) -> float:
+    def _f_value(mode: str, u, y_meas, sigma_n: float, operator=None) -> float:
         # returns mean over batch of the *true* paper fidelity value
         #   linear:  (1/(2 sigma_n^2)) ||u - y||^2
         #   phase:   (1/(2 sigma_n^2)) || |u| - y ||^2
         with torch.no_grad():
             if mode == "phase_retrieval":
                 r = (u.abs() - y_meas).reshape(u.shape[0], -1)
+                return float(0.5 / (sigma_n**2) * r.pow(2).sum(dim=1).mean().detach())
+            if mode == "transmission_ct":
+                eta = float(getattr(operator, "eta", 1.0))
+                i0 = operator.incident_counts(u).to(device=u.device, dtype=u.dtype)
+                val = eta * (i0 * torch.exp(-u) + y_meas * u)
+                return float(val.reshape(u.shape[0], -1).sum(dim=1).mean().detach())
             else:
                 r = (u - y_meas).reshape(u.shape[0], -1)
-            return float(0.5 / (sigma_n**2) * r.pow(2).sum(dim=1).mean().detach())
+                return float(0.5 / (sigma_n**2) * r.pow(2).sum(dim=1).mean().detach())
 
     # -------------------------
     # Operator norm estimation (kept)
@@ -687,12 +767,16 @@ class PDHG(nn.Module):
         K = int(self.admm_config.max_iter)
         pbar = tqdm.trange(K) if verbose else range(K)
 
-        # init (same pattern as DYS)
-        x_k, z_k, y_k = self.get_start(ref_img)
-        x_k = y_k
-        x_bar = x_k.clone()
-
         sigma_n = float(getattr(operator, "sigma", 0.05))
+        # init
+        if mode == "transmission_ct":
+            x_k = -torch.ones_like(ref_img)
+            z_k = -torch.ones_like(ref_img)
+            y_k = -torch.ones_like(ref_img)
+        else:
+            x_k, z_k, y_k = self.get_start(ref_img)
+            x_k = y_k
+        x_bar = x_k.clone()
 
         # dual init
         if mode == "phase_retrieval":
@@ -798,6 +882,15 @@ class PDHG(nn.Module):
                     sigma_dual=self.sigma_dual,
                     sigma_n=sigma_n
                 )
+            elif mode == "transmission_ct":
+                z_bar = operator(x_bar)
+                p_new, prox_move, prox_radial_resid = self._dual_update_transmission_ct_diag(
+                    p=p_k,
+                    z_bar=z_bar,
+                    y_counts=measurement,
+                    sigma_dual=self.sigma_dual,
+                    operator=operator,
+                )
             else:
                 Ax_bar = operator(x_bar)
                 p_new = self._dual_update_linear_mse(
@@ -812,14 +905,16 @@ class PDHG(nn.Module):
             # v_k in the paper corresponds to w here:
             if mode == "phase_retrieval":
                 w = (p_old + self.sigma_dual * u_bar) / self.sigma_dual
+            elif mode == "transmission_ct":
+                w = (p_old + self.sigma_dual * z_bar) / self.sigma_dual
             else:
                 w = (p_old + self.sigma_dual * Ax_bar) / self.sigma_dual
 
-            f_vk = self._f_value(mode, w, measurement, sigma_n)
+            f_vk = self._f_value(mode, w, measurement, sigma_n, operator=operator)
 
             # also get the proximal point u_{k+1} (optional, but useful)
             u_k1 = w - p_k / self.sigma_dual   # p_k is already p_new at this point
-            f_uk1 = self._f_value(mode, u_k1, measurement, sigma_n)
+            f_uk1 = self._f_value(mode, u_k1, measurement, sigma_n, operator=operator)
 
             # dual stats
             if mode == "phase_retrieval":
@@ -852,7 +947,7 @@ class PDHG(nn.Module):
             # =========================
             # This is the PDHG analogue of ADMM's "dual_over_sigma":
             # how large is the (tau*A^T p) shift, in units of sigma_d.
-            dual_inject = self.tau * ATp
+            dual_inject = tau_k * ATp
             # --- adaptive tau cap to enforce du/sigma <= alpha_max ---
             ATp_norm = self._img_norm_mean(ATp)                 # ||ATp||/sqrt(d)
             """ tau_cap = alpha_max * sigma_d / (ATp_norm + eps)    # ensures ||tau*ATp||/sigma <= alpha_max
@@ -883,9 +978,6 @@ class PDHG(nn.Module):
             # =========================
             # (3) Denoise -> x_new
             # =========================
-            z_k = x_k - self.tau * ATp
-            #z_k = self.phase_only_ac(operator, z_k, sigma_phase=sigma_d)
-
             x_new = self.optimize_denoising(
                 z_in=z_k,
                 model=model,
@@ -910,9 +1002,9 @@ class PDHG(nn.Module):
             else:
                 Kxk = operator(x_k)
 
-            f_Kxk = self._f_value(mode, Kxk, measurement, sigma_n)
-            dual_inject_norm = self.tau*math.sqrt(f_vk)/sigma_d
-            dual_inject_over_sigma = self.tau*math.sqrt(f_Kxk)/sigma_d
+            f_Kxk = self._f_value(mode, Kxk, measurement, sigma_n, operator=operator)
+            dual_inject_norm = tau_k * math.sqrt(f_vk) / sigma_d
+            dual_inject_over_sigma = tau_k * math.sqrt(f_Kxk) / sigma_d
             # =========================
             # Convergence check (optional)
             # =========================
@@ -949,7 +1041,7 @@ class PDHG(nn.Module):
                 self.trajectory.add_tensor('z_k', z_k)
                 self.trajectory.add_tensor('y_k', y_k)
                 self.trajectory.add_value('sigma', sigma_d)
-                self.trajectory.add_value('tau', float(self.tau))
+                self.trajectory.add_value('tau', float(tau_k))
                 self.trajectory.add_value('sigma_dual', float(self.sigma_dual))
                 self.trajectory.add_value('theta', float(theta))
                 if delta is not None:
@@ -978,7 +1070,7 @@ class PDHG(nn.Module):
 
                 # trace dict
                 self._trace_add_value("sigma", sigma_d)
-                self._trace_add_value("tau", float(self.tau))
+                self._trace_add_value("tau", float(tau_k))
                 self._trace_add_value("sigma_dual", float(self.sigma_dual))
                 self._trace_add_value("theta", float(theta))
                 if delta is not None:
@@ -1035,7 +1127,7 @@ class PDHG(nn.Module):
                     logd = {
                         "PDHG Iteration": step + 1,
                         "sigma": float(sigma_d),
-                        "tau": float(self.tau),
+                        "tau": float(tau_k),
                         "sigma_dual": float(self.sigma_dual),
                         "theta": float(theta),
                         "p_norm": float(p_norm),

@@ -1,0 +1,22 @@
+name: "CTFolder"
+resolution: 512
+image_root_path: "./demo-samples/MIDI-B-Synthetic-Test/3483372051/11-14-2015-NA-Ordered for 3483372051 by KC-20068/20151114.000000-Low Dose Images 20151114-78783"
+start_idx: 74
+end_idx: 75
+device: 'cuda'
+center_crop: true
+percentile_min: 0.5
+percentile_max: 99.5
+valid_extensions:
+  - .png
+  - .PNG
+  - .jpg
+  - .JPG
+  - .jpeg
+  - .JPEG
+  - .tif
+  - .TIF
+  - .tiff
+  - .TIFF
+  - .dcm
+  - .DCM

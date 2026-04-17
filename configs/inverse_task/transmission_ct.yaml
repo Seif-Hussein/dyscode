@@ -1,0 +1,77 @@
+lgvd_config:
+  num_steps: 100
+  lr: 1.0e-4
+  tau: 0.01
+  lr_min_ratio: 0.01
+
+admm_config:
+  max_iter: 400
+  rho: 100
+  eta: 0.99
+  gamma: 1
+  low_t_patience: 40
+  delta_tol: 1e-10
+  delta_patience: 10
+  init_factor:
+    x: 0.01
+    z: 0.01
+    u: 0
+  ml:
+    max_iter: 1000
+    lr: 3.0e-2
+    tol: 1.0e-1
+    optimizer: Adam
+    clip: False
+    lr_decay: 1.3
+    lr_min: 1.0e-25
+    patience: 3
+    verbose: False
+  denoise:
+    type: denoise
+    final_step: tweedie
+    t_window_max: 10
+    t_window_min: 3
+    t_minimum: 20
+    lgvd:
+      reg_factor: 0.0
+      num_steps: 0
+      lr: 5.0e-4
+    diffusion:
+      beta_start: 0.0001
+      beta_end: 0.02
+      T: 1000
+  dys:
+    gamma: 0.1
+    lambda_schedule:
+      activate: true
+      start: 0.2
+      end: 1.0
+      warmup: 50
+  pdhg:
+    tau: 0.01
+    sigma_dual: 1200
+    theta_schedule:
+      activate: true
+      start: 0.0
+      end: 0.0
+      warmup: 50
+    sigma_n: 1.0
+    init_dual: zeros
+  proj:
+    activate: false
+    min: 0.0
+    max: 1.0
+
+operator:
+  name: transmission_ct
+  resolution: 512
+  channels: 1
+  num_angles: 80
+  num_detectors: 512
+  angle_offset_deg: 0.0
+  detector_scale: 1.0
+  attenuation_min: 0.0
+  attenuation_max: 1.0
+  eta: 1.0
+  I0: 10000.0
+  sigma: 1.0

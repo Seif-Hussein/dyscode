@@ -1,0 +1,7 @@
+name: 'dm4ct_pixel_diffusers'
+model_config:
+  model_id: pretrained-models/dm4ct/lodochallenge_pixel_diffusion
+  local_files_only: true
+  clamp_output: true
+  sigma_eps: 1.0e-6
+  torch_dtype: float32

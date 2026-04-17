@@ -97,6 +97,15 @@ def resize(y, x, inverse_task_name):
             return tmp
 
         ry = norm_01(ry) * 2 - 1
+    elif inverse_task_name == 'transmission_ct':
+        # Transmission measurements are raw photon counts, not image-valued
+        # tensors in a normalized image range. For visualization only, map each
+        # sample/channel to [0, 1] using a robust min-max so the sinogram
+        # contrast is visible.
+        dims = tuple(range(2, ry.dim()))
+        lo = ry.amin(dim=dims, keepdim=True)
+        hi = ry.amax(dim=dims, keepdim=True)
+        ry = (ry - lo) / (hi - lo + 1.0e-8)
     return ry
 
 
@@ -113,6 +122,14 @@ def norm(x):
     """
         normalize data to [0, 1] range
     """
+    if torch.is_tensor(x):
+        xmin = float(x.min().detach())
+        xmax = float(x.max().detach())
+    else:
+        xmin = float(np.min(x))
+        xmax = float(np.max(x))
+    if xmin >= -1.0e-6 and xmax <= 1.0 + 1.0e-6:
+        return x.clip(0, 1)
     return (x * 0.5 + 0.5).clip(0, 1)
 
 
@@ -124,6 +141,8 @@ def tensor_to_pils(x):
     for x_ in x:
         np_x = norm(x_).permute(1, 2, 0).cpu().numpy() * 255
         np_x = np_x.astype(np.uint8)
+        if np_x.shape[-1] == 1:
+            np_x = np_x[..., 0]
         pil_x = Image.fromarray(np_x)
         pils.append(pil_x)
     return pils
@@ -133,7 +152,10 @@ def tensor_to_numpy(x):
         [B, C, H, W] tensor -> [B, C, H, W] numpy
     """
     np_images = norm(x).permute(0, 2, 3, 1).cpu().numpy() * 255
-    return np_images.astype(np.uint8)
+    np_images = np_images.astype(np.uint8)
+    if np_images.shape[-1] == 1:
+        np_images = np.repeat(np_images, 3, axis=-1)
+    return np_images
 
 
 def save_mp4_video(gt, y, x0hat_traj, x0y_traj, xt_traj, output_path, fps=24, sec=15, space=4):
@@ -178,7 +200,7 @@ def log_results(args, sde_trajs, results, images, y, full_samples, table_markdow
     # log grid results
     resized_y = resize(y, images, args.inverse_task.operator.name)
     stack = torch.cat([images, resized_y, full_samples])
-    save_image(stack * 0.5 + 0.5, fp=str(root / 'grid_results.png'), nrow=total_number)
+    save_image(norm(stack), fp=str(root / 'grid_results.png'), nrow=total_number)
 
     # log individual sample instances
     if args.save_samples:

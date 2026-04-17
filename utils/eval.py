@@ -168,8 +168,20 @@ def get_eval_fn_cmp(name: str):
 
 
 class EvalFn(ABC):
-    def norm(self, x):
+    def norm(self, x, assume_zero_one: bool = False):
+        if assume_zero_one:
+            return x.clip(0, 1)
+        xmin = float(x.min().detach())
+        xmax = float(x.max().detach())
+        if xmin >= -1.0e-6 and xmax <= 1.0 + 1.0e-6:
+            return x.clip(0, 1)
         return (x * 0.5 + 0.5).clip(0, 1)
+
+    @staticmethod
+    def _gt_is_zero_one(gt: torch.Tensor) -> bool:
+        gmin = float(gt.min().detach())
+        gmax = float(gt.max().detach())
+        return gmin >= -1.0e-6 and gmax <= 1.0 + 1.0e-6
 
     @abstractmethod
     def __call__(self, gt, measurement, sample, reduction='none'):
@@ -181,7 +193,13 @@ class PeakSignalNoiseRatio(EvalFn):
     cmp = 'max'  # the higher, the better
 
     def __call__(self, gt, measurement, sample, reduction='none'):
-        return psnr(self.norm(gt), self.norm(sample), data_range=1.0, reduction=reduction)
+        assume_zero_one = self._gt_is_zero_one(gt)
+        return psnr(
+            self.norm(gt, assume_zero_one=assume_zero_one),
+            self.norm(sample, assume_zero_one=assume_zero_one),
+            data_range=1.0,
+            reduction=reduction,
+        )
 
 
 @register_eval_fn('ssim')
@@ -189,7 +207,13 @@ class StructuralSimilarityIndexMeasure(EvalFn):
     cmp = 'max'  # the higher, the better
 
     def __call__(self, gt, measurement, sample, reduction='none'):
-        return ssim(self.norm(gt), self.norm(sample), data_range=1.0, reduction=reduction)
+        assume_zero_one = self._gt_is_zero_one(gt)
+        return ssim(
+            self.norm(gt, assume_zero_one=assume_zero_one),
+            self.norm(sample, assume_zero_one=assume_zero_one),
+            data_range=1.0,
+            reduction=reduction,
+        )
 
 
 @register_eval_fn('lpips')
@@ -203,8 +227,12 @@ class LearnedPerceptualImagePatchSimilarity(EvalFn):
     def evaluate_in_batch(self, gt, pred):
         batch_size = self.batch_size
         results = []
+        assume_zero_one = self._gt_is_zero_one(gt)
         for start in range(0, gt.shape[0], batch_size):
-            res = self.lpips_fn(self.norm(gt[start:start+batch_size]), self.norm(pred[start:start+batch_size]))
+            res = self.lpips_fn(
+                self.norm(gt[start:start+batch_size], assume_zero_one=assume_zero_one),
+                self.norm(pred[start:start+batch_size], assume_zero_one=assume_zero_one),
+            )
             results.append(res)
         results = torch.cat(results, dim=0)
         return results

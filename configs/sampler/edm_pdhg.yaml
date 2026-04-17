@@ -2,13 +2,13 @@ name: pdhg
 latent: False
 
 annealing_scheduler_config:
-  num_steps: 100
+  num_steps: 400
   #sigma_max: 1
   #sigma_min: 0.01
   #sigma_max: 27
   #sigma_min: 0.095
-  sigma_max: 27
-  sigma_min: 0.095
+  sigma_max: 25
+  sigma_min: 0.05
   sigma_final: 0
   schedule: 'linear'
   timestep: 'poly-7'

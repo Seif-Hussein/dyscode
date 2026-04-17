@@ -1,0 +1,57 @@
+study:
+  name: pdhg_transmission_ct_batched_grid
+  output_root: tuning_runs
+
+runner:
+  config_name: default_ct.yaml
+  workdir: .
+
+scoring:
+  primary_metric: psnr
+  comparator: auto
+
+report:
+  top_k: 10
+
+batched:
+  candidate_chunk_size: 8
+  progress_update_every: 10
+
+base_overrides:
+  - sampler=edm_pdhg
+  - inverse_task=transmission_ct
+  - name=PDHG_CT_Batched_Tuning
+  - wandb=false
+  - save_samples=false
+  - save_traj=false
+  - save_traj_raw_data=false
+  - show_config=false
+  - total_images=1
+  - batch_size=1
+  - num_runs=1
+  - sampler.annealing_scheduler_config.num_steps=400
+  - inverse_task.admm_config.denoise.final_step=tweedie
+  - inverse_task.admm_config.max_iter=400
+  - inverse_task.admm_config.denoise.lgvd.num_steps=0
+
+grid:
+  sampler.annealing_scheduler_config.sigma_max:
+    values:
+      - 20
+      - 27
+      - 30
+  sampler.annealing_scheduler_config.sigma_min:
+    values:
+      - 0.05
+      - 0.075
+      - 0.1
+  inverse_task.admm_config.pdhg.tau:
+    values:
+      - 0.005
+      - 0.0075
+      - 0.01
+  inverse_task.admm_config.pdhg.sigma_dual:
+    values:
+      - 800
+      - 1200
+      - 1600

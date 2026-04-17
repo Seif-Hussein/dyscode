@@ -46,7 +46,7 @@ def main(args):
     operator = get_operator(**args.inverse_task.operator)
 
     '''Get image from the dataset'''
-    total_number = min(args.batch_size, len(dataset))
+    total_number = min(args.total_images, len(dataset))
     dataloader = DataLoader(dataset, batch_size=args.total_images, shuffle=False)
     images = next(iter(dataloader)).to(f'cuda:{args.gpu}')
     y = operator.measure(images)
@@ -116,7 +116,7 @@ def main(args):
 
     # log results
     log_results(args, full_trajs, results, images, y,
-                full_samples, markdown_text, args.total_images)
+                full_samples, markdown_text, total_number)
     if args.wandb:
         evaluator.log_wandb(results, args.batch_size)
         wandb.finish()
