@@ -1,0 +1,99 @@
+study:
+  name: pdhg_phase_retrieval_exact_list
+  output_root: tuning_runs
+  result_root: results/tuning
+  hydra_root: outputs/tuning
+
+runner:
+  python_executable: python
+  entrypoint: recover_inverse2.py
+  config_name: default_ffhq.yaml
+  workdir: .
+
+scoring:
+  primary_metric: psnr
+  comparator: auto
+  aggregate: mean
+
+report:
+  top_k: 10
+
+base_overrides:
+  - sampler=edm_pdhg
+  - inverse_task=phase_retrieval
+  - name=PDHG_Exact_List_Tuning
+  - seed=99
+  - wandb=false
+  - save_samples=false
+  - save_traj=false
+  - save_traj_raw_data=false
+  - show_config=false
+  - total_images=100
+  - batch_size=100
+  - num_runs=1
+  - inverse_task.operator.sigma=0.05
+  - sampler.annealing_scheduler_config.num_steps=500
+  - inverse_task.admm_config.denoise.final_step=tweedie
+  - inverse_task.admm_config.max_iter=500
+  - inverse_task.admm_config.dys.gamma=0.0075
+  - inverse_task.admm_config.dys.lambda_schedule.activate=true
+  - inverse_task.admm_config.dys.lambda_schedule.start=1
+  - inverse_task.admm_config.dys.lambda_schedule.end=1
+  - inverse_task.admm_config.dys.lambda_schedule.warmup=0
+  - inverse_task.admm_config.denoise.lgvd.num_steps=0
+
+candidates:
+  - name: sigma_a_step_1
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 20
+      sampler.annealing_scheduler_config.sigma_min: 0.05
+      inverse_task.admm_config.pdhg.tau: 0.005
+      inverse_task.admm_config.pdhg.sigma_dual: 800
+  - name: sigma_a_step_2
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 20
+      sampler.annealing_scheduler_config.sigma_min: 0.05
+      inverse_task.admm_config.pdhg.tau: 0.0075
+      inverse_task.admm_config.pdhg.sigma_dual: 1200
+  - name: sigma_a_step_3
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 20
+      sampler.annealing_scheduler_config.sigma_min: 0.05
+      inverse_task.admm_config.pdhg.tau: 0.01
+      inverse_task.admm_config.pdhg.sigma_dual: 1600
+  - name: sigma_b_step_1
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 27
+      sampler.annealing_scheduler_config.sigma_min: 0.075
+      inverse_task.admm_config.pdhg.tau: 0.005
+      inverse_task.admm_config.pdhg.sigma_dual: 800
+  - name: sigma_b_step_2
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 27
+      sampler.annealing_scheduler_config.sigma_min: 0.075
+      inverse_task.admm_config.pdhg.tau: 0.0075
+      inverse_task.admm_config.pdhg.sigma_dual: 1200
+  - name: sigma_b_step_3
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 27
+      sampler.annealing_scheduler_config.sigma_min: 0.075
+      inverse_task.admm_config.pdhg.tau: 0.01
+      inverse_task.admm_config.pdhg.sigma_dual: 1600
+  - name: sigma_c_step_1
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 30
+      sampler.annealing_scheduler_config.sigma_min: 0.1
+      inverse_task.admm_config.pdhg.tau: 0.005
+      inverse_task.admm_config.pdhg.sigma_dual: 800
+  - name: sigma_c_step_2
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 30
+      sampler.annealing_scheduler_config.sigma_min: 0.1
+      inverse_task.admm_config.pdhg.tau: 0.0075
+      inverse_task.admm_config.pdhg.sigma_dual: 1200
+  - name: sigma_c_step_3
+    params:
+      sampler.annealing_scheduler_config.sigma_max: 30
+      sampler.annealing_scheduler_config.sigma_min: 0.1
+      inverse_task.admm_config.pdhg.tau: 0.01
+      inverse_task.admm_config.pdhg.sigma_dual: 1600
