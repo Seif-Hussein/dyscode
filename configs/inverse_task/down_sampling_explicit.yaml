@@ -70,7 +70,7 @@ admm_config:
     # ----- Dual initialization
     init_dual: noise
 operator:
-  name: down_sampling
+  name: down_sampling_explicit
   resolution: 256
   channels: 3
   scale_factor: 4
