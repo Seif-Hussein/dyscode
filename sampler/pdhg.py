@@ -225,29 +225,38 @@ class PDHG(nn.Module):
     # -------------------------
     # Operator mode selection
     # -------------------------
+    @staticmethod
+    def _measurement_model(operator) -> str | None:
+        model = getattr(operator, "measurement_model", None)
+        if model is None:
+            return None
+        return str(model)
+
     def _mode(self, operator, measurement) -> str:
         name = getattr(operator, "name", None)
+        measurement_model = self._measurement_model(operator)
 
-        if name == "phase_retrieval":
+        if measurement_model == "phase_retrieval" or name == "phase_retrieval":
             if not (hasattr(operator, "forward_complex") and hasattr(operator, "adjoint_complex")):
                 raise RuntimeError("phase_retrieval operator must implement forward_complex and adjoint_complex.")
             if not torch.is_tensor(measurement):
                 raise RuntimeError("phase_retrieval measurement must be a tensor amplitude.")
             return "phase_retrieval"
 
-        if name == "transmission_ct":
+        if measurement_model == "transmission_ct" or name == "transmission_ct":
             if not torch.is_tensor(measurement):
                 raise RuntimeError("transmission_ct measurement must be a tensor of Poisson counts.")
             return "transmission_ct"
 
-        if name in self.SUPPORTED_LINEAR_NAMES:
+        if measurement_model == "linear_mse" or name in self.SUPPORTED_LINEAR_NAMES:
             if not torch.is_tensor(measurement):
-                raise RuntimeError(f"{name} measurement must be a tensor for MSE loss.")
+                op_name = name if name is not None else measurement_model
+                raise RuntimeError(f"{op_name} measurement must be a tensor for MSE loss.")
             return "linear_mse"
 
         raise NotImplementedError(
             f"PDHG supports phase_retrieval and linear-MSE operators {sorted(self.SUPPORTED_LINEAR_NAMES)}.\n"
-            f"Got operator.name={name}."
+            f"Got operator.name={name}, measurement_model={measurement_model}."
         )
 
     # -------------------------
@@ -275,6 +284,14 @@ class PDHG(nn.Module):
                 only_inputs=True
             )[0]
         return grad.detach()
+
+    def _AT_operator(self, operator, x_like: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        if hasattr(operator, "adjoint") and callable(getattr(operator, "adjoint")):
+            try:
+                return operator.adjoint(p, x_like=x_like)
+            except TypeError:
+                return operator.adjoint(p)
+        return self._AT_autograd(operator, x_like, p)
 
     # -------------------------
     # Dual prox updates
@@ -338,6 +355,9 @@ class PDHG(nn.Module):
 
     def _prox_transmission_ct(self, w: torch.Tensor, y_counts: torch.Tensor,
                               sigma_dual: float, operator, eps: float = 1e-12) -> torch.Tensor:
+        if hasattr(operator, "dual_prox") and callable(getattr(operator, "dual_prox")):
+            return operator.dual_prox(w=w, y_counts=y_counts, sigma_dual=sigma_dual, eps=eps)
+
         sigma_view = self._param_view(sigma_dual, w, dtype=w.dtype)
         eta = float(getattr(operator, "eta", 1.0))
         eta_tensor = torch.as_tensor(eta, device=w.device, dtype=w.dtype)
@@ -583,7 +603,7 @@ class PDHG(nn.Module):
                     operator=operator,
                 )
                 p_k = q - sigma_dual_view * z_prox
-                at_p = self._AT_autograd(operator, x_k, p_k)
+                at_p = self._AT_operator(operator, x_k, p_k)
 
             tau_view = self._param_view(tau_batch_expanded, x_k, dtype=x_k.dtype)
             z_k = x_k - tau_view * at_p
@@ -711,7 +731,7 @@ class PDHG(nn.Module):
         x = x / (x.norm() + 1e-12)
         for _ in range(iters):
             Ax = operator(x)
-            x = self._AT_autograd(operator, x, Ax)
+            x = self._AT_operator(operator, x, Ax)
             x = x / (x.norm() + 1e-12)
         Ax = operator(x)
         num = (Ax ** 2).sum()
@@ -766,6 +786,7 @@ class PDHG(nn.Module):
 
         start_time = time.time()
         eps = 1e-12
+        self._init_metric_history()
 
         if record:
             self.trajectory = Trajectory()
@@ -786,7 +807,6 @@ class PDHG(nn.Module):
             z_k = -torch.ones_like(ref_img)
             y_k = -torch.ones_like(ref_img)
         else:
-        self._init_metric_history()
             x_k, z_k, y_k = self.get_start(ref_img)
             x_k = y_k
         x_bar = x_k.clone()
@@ -857,6 +877,11 @@ class PDHG(nn.Module):
             #self.sigma_dual = 1.01**step
             #self.tau = 1/self.sigma_dual
             #sigma_d = 1/math.sqrt(self.sigma_dual)
+            """if sigma_d < 0.75:
+                sigma_d  = 1/np.sqrt(t_sigma+1)
+                tau_k = sigma_d**2
+            else:
+                tau_k = self.tau"""
             tau_k = self.tau
             """rho_k = 0.001/sigma_d**2
             self.tau = rho_k*0.01
@@ -950,7 +975,7 @@ class PDHG(nn.Module):
                 kstar_p_x01 = operator.adjoint_complex(p_k, out_hw=(x_k.shape[-2], x_k.shape[-1]))
                 ATp = 0.5 * kstar_p_x01
             else:
-                ATp = self._AT_autograd(operator, x_k, p_k)
+                ATp = self._AT_operator(operator, x_k, p_k)
 
             # denoiser input
             #z_k = x_k - self.tau * ATp
@@ -1123,6 +1148,16 @@ class PDHG(nn.Module):
                     z_k_results = evaluator(gt, measurement, z_k)
                     x_k_results = evaluator(gt, measurement, x_k)
 
+                self._metric_history_add("step", step + 1)
+                self._metric_history_add("sigma", sigma_d)
+                self._metric_history_add("tau", float(tau_k))
+                self._metric_history_add("sigma_dual", float(self.sigma_dual))
+                self._metric_history_add("theta", float(theta))
+                for metric_name, metric_value in z_k_results.items():
+                    self._metric_history_add(f"z_k_{metric_name}", metric_value.item())
+                for metric_name, metric_value in x_k_results.items():
+                    self._metric_history_add(f"x_k_{metric_name}", metric_value.item())
+
                 if verbose:
                     main = evaluator.main_eval_fn_name
                     postfix = {
@@ -1148,16 +1183,6 @@ class PDHG(nn.Module):
                         "dual_inject_over_sigma": float(dual_inject_over_sigma),
                         "wall_time": time.time() - start_time,
                     }
-                self._metric_history_add("step", step + 1)
-                self._metric_history_add("sigma", sigma_d)
-                self._metric_history_add("tau", float(tau_k))
-                self._metric_history_add("sigma_dual", float(self.sigma_dual))
-                self._metric_history_add("theta", float(theta))
-                for metric_name, metric_value in z_k_results.items():
-                    self._metric_history_add(f"z_k_{metric_name}", metric_value.item())
-                for metric_name, metric_value in x_k_results.items():
-                    self._metric_history_add(f"x_k_{metric_name}", metric_value.item())
-
                     if delta is not None:
                         logd["delta"] = float(delta)
                     if amp_resid_z is not None:
