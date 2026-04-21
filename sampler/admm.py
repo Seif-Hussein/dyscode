@@ -155,13 +155,17 @@ class ADMM(nn.Module):
 
         self.trace = None
         self.trajectory = None
+        self.metric_history = None
 
     # -------------------------
     # Trace helpers
     # -------------------------
     def _init_trace(self):
         self.trace = {}
-        
+
+    def _init_metric_history(self):
+        self.metric_history = {}
+
     @staticmethod
     def _img_norm_mean(x: torch.Tensor) -> float:
         """
@@ -190,6 +194,14 @@ class ADMM(nn.Module):
 
     def get_trace(self):
         return self.trace
+
+    def _metric_history_add(self, key: str, value):
+        if self.metric_history is None:
+            return
+        self.metric_history.setdefault(key, []).append(float(value))
+
+    def get_metric_history(self):
+        return self.metric_history
 
     # -------------------------
     # ML / data subproblem
@@ -458,6 +470,7 @@ class ADMM(nn.Module):
 
         start_time = time.time()
         eps = 1e-12
+        self._init_metric_history()
 
         if record:
             self.trajectory = Trajectory()
@@ -597,6 +610,15 @@ class ADMM(nn.Module):
                     gt = kwargs['gt']
                     x_k_results = evaluator(gt, measurement, x_k)
                     z_k_results = evaluator(gt, measurement, z_k)
+
+                self._metric_history_add("step", step + 1)
+                self._metric_history_add("sigma", sigma)
+                self._metric_history_add("rho", float(self.admm_config.rho))
+                for metric_name, metric_value in x_k_results.items():
+                    self._metric_history_add(f"x_k_{metric_name}", metric_value.item())
+                for metric_name, metric_value in z_k_results.items():
+                    self._metric_history_add(f"z_k_{metric_name}", metric_value.item())
+
                 if verbose:
                     main = evaluator.main_eval_fn_name
                     postfix = {

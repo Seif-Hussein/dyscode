@@ -190,7 +190,8 @@ def save_mp4_video(gt, y, x0hat_traj, x0y_traj, xt_traj, output_path, fps=24, se
     writer.close()
 
 
-def log_results(args, sde_trajs, results, images, y, full_samples, table_markdown, total_number):
+def log_results(args, sde_trajs, results, images, y, full_samples, table_markdown, total_number,
+                metric_history=None):
     # log hyperparameters and configurations
     full_samples = full_samples.flatten(0, 1)
     root = safe_dir(Path(args.save_dir) / f"{args.name}_{args.data.name}_{args.inverse_task.operator.name}")
@@ -263,3 +264,5 @@ def log_results(args, sde_trajs, results, images, y, full_samples, table_markdow
     with open(str(root / 'eval.md'), 'w') as file:
         file.write(table_markdown)
     json.dump(results, open(str(root / 'metrics.json'), 'w'), indent=4)
+    if metric_history is not None:
+        json.dump(metric_history, open(str(root / 'metric_history.json'), 'w'), indent=4)

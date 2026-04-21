@@ -122,12 +122,24 @@ class PDHG(nn.Module):
         # Trace storage
         self.trace = None
         self.trajectory = None
+        self.metric_history = None
 
     # -------------------------
     # Trace helpers
     # -------------------------
     def _init_trace(self):
         self.trace = {}
+
+    def _init_metric_history(self):
+        self.metric_history = {}
+
+    def _metric_history_add(self, key: str, value):
+        if self.metric_history is None:
+            return
+        self.metric_history.setdefault(key, []).append(float(value))
+
+    def get_metric_history(self):
+        return self.metric_history
 
     @staticmethod
     def _param_vector(value, batch_size: int, device, dtype=torch.float32) -> torch.Tensor:
@@ -774,6 +786,7 @@ class PDHG(nn.Module):
             z_k = -torch.ones_like(ref_img)
             y_k = -torch.ones_like(ref_img)
         else:
+        self._init_metric_history()
             x_k, z_k, y_k = self.get_start(ref_img)
             x_k = y_k
         x_bar = x_k.clone()
@@ -1135,6 +1148,16 @@ class PDHG(nn.Module):
                         "dual_inject_over_sigma": float(dual_inject_over_sigma),
                         "wall_time": time.time() - start_time,
                     }
+                self._metric_history_add("step", step + 1)
+                self._metric_history_add("sigma", sigma_d)
+                self._metric_history_add("tau", float(tau_k))
+                self._metric_history_add("sigma_dual", float(self.sigma_dual))
+                self._metric_history_add("theta", float(theta))
+                for metric_name, metric_value in z_k_results.items():
+                    self._metric_history_add(f"z_k_{metric_name}", metric_value.item())
+                for metric_name, metric_value in x_k_results.items():
+                    self._metric_history_add(f"x_k_{metric_name}", metric_value.item())
+
                     if delta is not None:
                         logd["delta"] = float(delta)
                     if amp_resid_z is not None:

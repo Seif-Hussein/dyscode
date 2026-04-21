@@ -66,12 +66,26 @@ def main(args):
     # main sampling process
     full_samples = []
     full_trajs = []
+    full_metric_histories = []
     for r in range(args.num_runs):
         print(f'Run: {r}')
-        samples, trajs = sample_in_batch(sampler, model, images, operator, y, evaluator, verbose=True,
-                                         record=True, batch_size=args.batch_size, gt=images, wandb=args.wandb)
+        samples, trajs, metric_history = sample_in_batch(
+            sampler,
+            model,
+            images,
+            operator,
+            y,
+            evaluator,
+            verbose=True,
+            record=True,
+            batch_size=args.batch_size,
+            gt=images,
+            wandb=args.wandb,
+        )
         full_samples.append(samples)
         full_trajs.append(trajs)
+        if metric_history:
+            full_metric_histories.append(metric_history)
     full_samples = torch.stack(full_samples, dim=0)
 
     # log metrics
@@ -80,8 +94,16 @@ def main(args):
     print(markdown_text)
 
     # log results
+    metric_history_artifact = None
+    if full_metric_histories:
+        metric_history_artifact = (
+            full_metric_histories[0]
+            if len(full_metric_histories) == 1
+            else {"runs": full_metric_histories}
+        )
     log_results(args, full_trajs, results, images, y,
-                full_samples, markdown_text, args.total_images)
+                full_samples, markdown_text, args.total_images,
+                metric_history=metric_history_artifact)
     if args.wandb:
         evaluator.log_wandb(results, args.batch_size)
         wandb.finish()
