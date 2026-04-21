@@ -6,9 +6,9 @@ from .resizer import Resizer
 # Original author: bingliang
 @register_operator(name='down_sampling')
 class DownSampling(Operator):
-    def __init__(self, resolution=256, scale_factor=4, device='cuda', sigma=0.05):
+    def __init__(self, resolution=256, scale_factor=4, device='cuda', sigma=0.05, channels=3):
         super().__init__(sigma)
-        in_shape = [1, 3, resolution, resolution]
+        in_shape = [1, channels, resolution, resolution]
         self.down_sample = Resizer(in_shape, 1 / scale_factor).to(device)
 
     def __call__(self, x):
