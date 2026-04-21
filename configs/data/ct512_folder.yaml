@@ -1,8 +1,8 @@
 name: "CTFolder"
 resolution: 512
-image_root_path: "./demo-samples/ct_single"
-start_idx: 0
-end_idx: 1
+image_root_path: "./demo-samples/ct_l067_subset"
+start_idx: 1
+end_idx: 2
 device: 'cuda'
 center_crop: true
 percentile_min: 0.5
@@ -20,3 +20,5 @@ valid_extensions:
   - .TIFF
   - .dcm
   - .DCM
+  - .ima
+  - .IMA
