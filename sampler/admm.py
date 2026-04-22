@@ -462,6 +462,8 @@ class ADMM(nn.Module):
                wandb: bool = False,
 
                record_every: int = 1,
+               progress_callback=None,
+               progress_every: int | None = 1,
                trace_downsample_to: int | None = 64,
                trace_internals: bool = False,
 
@@ -494,6 +496,7 @@ class ADMM(nn.Module):
             self.trajectory = None
 
         max_iter = self._effective_max_iter()
+        progress_every = int(progress_every or 0)
         pbar = tqdm.trange(max_iter) if verbose else range(max_iter)
 
         x_k, z_k, u_k = self.get_start(ref_img)
@@ -621,6 +624,7 @@ class ADMM(nn.Module):
 
             # evaluation (optional)
             elapsed_seconds_per_image = (time.time() - start_time) / max(1, x_k.shape[0])
+            latest_metrics = {}
             if evaluator and 'gt' in kwargs:
                 with torch.no_grad():
                     gt = kwargs['gt']
@@ -632,9 +636,13 @@ class ADMM(nn.Module):
                 self._metric_history_add("rho", float(self.admm_config.rho))
                 self._metric_history_add("elapsed_seconds_per_image", elapsed_seconds_per_image)
                 for metric_name, metric_value in x_k_results.items():
-                    self._metric_history_add(f"x_k_{metric_name}", metric_value.item())
+                    metric_scalar = metric_value.item()
+                    latest_metrics[f"x_k_{metric_name}"] = float(metric_scalar)
+                    self._metric_history_add(f"x_k_{metric_name}", metric_scalar)
                 for metric_name, metric_value in z_k_results.items():
-                    self._metric_history_add(f"z_k_{metric_name}", metric_value.item())
+                    metric_scalar = metric_value.item()
+                    latest_metrics[f"z_k_{metric_name}"] = float(metric_scalar)
+                    self._metric_history_add(f"z_k_{metric_name}", metric_scalar)
 
                 if verbose:
                     main = evaluator.main_eval_fn_name
@@ -648,6 +656,24 @@ class ADMM(nn.Module):
                     if ze_misalign is not None:
                         postfix['ze/s'] = f"{ze_misalign:.2e}"
                     pbar.set_postfix(postfix)
+
+            if (
+                progress_callback is not None and (
+                    step == 0
+                    or step + 1 == max_iter
+                    or (progress_every > 0 and (step + 1) % progress_every == 0)
+                )
+            ):
+                progress_callback(
+                    sampler="AC-DC-ADMM",
+                    step=int(step + 1),
+                    max_iter=int(max_iter),
+                    sigma=float(sigma),
+                    rho=float(self.admm_config.rho),
+                    elapsed_seconds_total=float(time.time() - start_time),
+                    elapsed_seconds_per_image=float(elapsed_seconds_per_image),
+                    latest_metrics=latest_metrics,
+                )
 
             # recording
             if record and (step % max(1, int(record_every)) == 0):

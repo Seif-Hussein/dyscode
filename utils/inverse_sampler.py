@@ -2,6 +2,7 @@
 # Original author: bingliang
 
 from .logging import Trajectory
+import inspect
 import torch
 from numbers import Real
 
@@ -87,6 +88,8 @@ def sample_in_batch(sampler,
                     record,
                     batch_size,
                     gt,
+                    progress_callback=None,
+                    progress_every=1,
                     **kwargs):
     """
         posterior sampling in batch
@@ -95,6 +98,10 @@ def sample_in_batch(sampler,
     trajs = []
     metric_histories = []
     batch_weights = []
+    sample_signature = inspect.signature(sampler.sample)
+    supports_progress_callback = "progress_callback" in sample_signature.parameters
+    supports_progress_every = "progress_every" in sample_signature.parameters
+    num_batches = max(1, (len(x_start) + batch_size - 1) // batch_size)
     for s in range(0, len(x_start), batch_size):
         # update evaluator to correct batch index
         cur_x_start = x_start[s:s + batch_size]
@@ -104,9 +111,31 @@ def sample_in_batch(sampler,
             cur_y = y[s:s+batch_size]
         
         cur_gt = gt[s: s + batch_size]
+        batch_index = len(samples) + 1
+
+        def current_progress_callback(**payload):
+            if progress_callback is None:
+                return
+            enriched_payload = dict(payload)
+            enriched_payload.update({
+                "batch_index": int(batch_index),
+                "num_batches": int(num_batches),
+                "batch_size": int(len(cur_x_start)),
+                "num_images_total": int(len(x_start)),
+                "batch_start_index": int(s),
+                "batch_end_index": int(s + len(cur_x_start)),
+            })
+            progress_callback(**enriched_payload)
+
+        sample_kwargs = dict(kwargs)
+        if supports_progress_callback:
+            sample_kwargs["progress_callback"] = current_progress_callback
+        if supports_progress_every:
+            sample_kwargs["progress_every"] = progress_every
+
         cur_samples = sampler.sample(model, cur_x_start, operator, cur_y,
                                      evaluator, verbose=verbose, record=record,
-                                     gt=cur_gt, **kwargs)
+                                     gt=cur_gt, **sample_kwargs)
 
         samples.append(cur_samples)
         cur_metric_history = getattr(sampler, "metric_history", None)

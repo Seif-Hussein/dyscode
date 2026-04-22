@@ -43,6 +43,7 @@ def build_notebook() -> dict:
             - `LPIPS`
 
             The notebook uses per-iteration sampler-side time from `metric_history.json`.
+            While a run is active, it also polls a live `progress.json` so Colab shows progress before the run finishes.
 
             Final output metrics follow the sampler's returned sample:
             - `PDHG`: `x_k`
@@ -121,6 +122,7 @@ def build_notebook() -> dict:
 
             TIME_TABLE_ROWS = 8  #@param {type:"integer"}
             TIME_TABLE_TARGETS = ""  #@param {type:"string"}
+            PROGRESS_REFRESH_SECONDS = 15  #@param {type:"integer"}
 
             # Optional extra Hydra overrides, separated by semicolons.
             EXTRA_HYDRA_OVERRIDES = ""  #@param {type:"string"}
@@ -326,6 +328,7 @@ def build_notebook() -> dict:
                 run_save_dir = run_dir / "results"
                 hydra_dir = run_dir / "hydra"
                 log_path = run_dir / "run.log"
+                progress_path = run_dir / "progress.json"
                 run_name = sanitize(label.replace("-", "_"))
 
                 command = [
@@ -341,6 +344,8 @@ def build_notebook() -> dict:
                     f"inverse_task.admm_config.max_iter={W}",
                     *method_overrides,
                     *extra_overrides,
+                    f"++progress_json_path={progress_path.as_posix()}",
+                    "++progress_json_every=1",
                     f"save_dir={run_save_dir.as_posix()}",
                     f"hydra.run.dir={hydra_dir.as_posix()}",
                 ]
@@ -354,6 +359,7 @@ def build_notebook() -> dict:
                     "run_save_dir": run_save_dir.as_posix(),
                     "hydra_dir": hydra_dir.as_posix(),
                     "log_path": log_path.as_posix(),
+                    "progress_path": progress_path.as_posix(),
                     "command": command,
                 }
 
@@ -422,6 +428,7 @@ def build_notebook() -> dict:
                         "label": entry["label"],
                         "W": entry["W"],
                         "run_save_dir": entry["run_save_dir"],
+                        "progress_path": entry["progress_path"],
                     }
                     for entry in plan
                 ]
@@ -443,6 +450,7 @@ def build_notebook() -> dict:
             import json
             import os
             import subprocess
+            import time
             from pathlib import Path
 
             import pandas as pd
@@ -461,6 +469,14 @@ def build_notebook() -> dict:
             def load_json(path: Path):
                 with path.open("r", encoding="utf-8") as handle:
                     return json.load(handle)
+
+            def load_json_if_exists(path: Path):
+                if not path.exists():
+                    return None
+                try:
+                    return load_json(path)
+                except json.JSONDecodeError:
+                    return None
 
             def find_single(root: Path, filename: str) -> Path:
                 matches = sorted(root.rglob(filename))
@@ -500,6 +516,81 @@ def build_notebook() -> dict:
                     if chunk:
                         pieces.append(float(chunk))
                 return pieces
+
+            def progress_signature(progress_payload: dict):
+                latest_metrics = progress_payload.get("latest_metrics", {})
+                if not isinstance(latest_metrics, dict):
+                    latest_metrics = {}
+                metric_items = tuple(
+                    (str(key), round(float(value), 5))
+                    for key, value in sorted(latest_metrics.items())
+                    if isinstance(value, (int, float))
+                )
+                return (
+                    progress_payload.get("status"),
+                    progress_payload.get("run_index"),
+                    progress_payload.get("batch_index"),
+                    progress_payload.get("step"),
+                    progress_payload.get("max_iter"),
+                    round(float(progress_payload.get("elapsed_seconds_per_image")), 5)
+                    if isinstance(progress_payload.get("elapsed_seconds_per_image"), (int, float))
+                    else None,
+                    metric_items,
+                )
+
+            def format_progress(progress_payload: dict):
+                pieces = []
+                status = progress_payload.get("status")
+                if status:
+                    pieces.append(f"status={status}")
+
+                run_index = progress_payload.get("run_index")
+                num_runs = progress_payload.get("num_runs")
+                if isinstance(run_index, int) and isinstance(num_runs, int):
+                    pieces.append(f"run={run_index}/{num_runs}")
+
+                batch_index = progress_payload.get("batch_index")
+                num_batches = progress_payload.get("num_batches")
+                if isinstance(batch_index, int) and isinstance(num_batches, int):
+                    pieces.append(f"batch={batch_index}/{num_batches}")
+
+                step = progress_payload.get("step")
+                max_iter = progress_payload.get("max_iter")
+                if isinstance(step, int) and isinstance(max_iter, int):
+                    pieces.append(f"step={step}/{max_iter}")
+
+                overall_fraction = progress_payload.get("overall_fraction_complete")
+                if isinstance(overall_fraction, (int, float)):
+                    pieces.append(f"overall={100.0 * float(overall_fraction):.1f}%")
+
+                elapsed_seconds_per_image = progress_payload.get("elapsed_seconds_per_image")
+                if isinstance(elapsed_seconds_per_image, (int, float)):
+                    pieces.append(f"time/image={float(elapsed_seconds_per_image):.3f}s")
+
+                sigma = progress_payload.get("sigma")
+                if isinstance(sigma, (int, float)):
+                    pieces.append(f"sigma={float(sigma):.4g}")
+
+                rho = progress_payload.get("rho")
+                if isinstance(rho, (int, float)):
+                    pieces.append(f"rho={float(rho):.4g}")
+
+                tau = progress_payload.get("tau")
+                if isinstance(tau, (int, float)):
+                    pieces.append(f"tau={float(tau):.4g}")
+
+                sigma_dual = progress_payload.get("sigma_dual")
+                if isinstance(sigma_dual, (int, float)):
+                    pieces.append(f"sigma_dual={float(sigma_dual):.4g}")
+
+                latest_metrics = progress_payload.get("latest_metrics", {})
+                if isinstance(latest_metrics, dict):
+                    for metric_key in ["x_k_psnr", "z_k_psnr", "x_k_ssim", "z_k_ssim", "x_k_lpips", "z_k_lpips"]:
+                        metric_value = latest_metrics.get(metric_key)
+                        if isinstance(metric_value, (int, float)):
+                            pieces.append(f"{metric_key}={float(metric_value):.4f}")
+
+                return " | ".join(pieces) if pieces else "progress update available"
 
             def choose_indices(times: list[float], num_rows: int, target_text: str):
                 if not times:
@@ -580,6 +671,7 @@ def build_notebook() -> dict:
                 run_dir = Path(entry["run_dir"])
                 run_save_dir = Path(entry["run_save_dir"])
                 log_path = Path(entry["log_path"])
+                progress_path = Path(entry["progress_path"])
                 run_dir.mkdir(parents=True, exist_ok=True)
                 run_save_dir.mkdir(parents=True, exist_ok=True)
                 log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -600,16 +692,37 @@ def build_notebook() -> dict:
                         skipped_existing = False
 
                 if not skipped_existing:
+                    if progress_path.exists():
+                        progress_path.unlink()
                     with log_path.open("w", encoding="utf-8") as handle:
-                        proc = subprocess.run(
+                        proc = subprocess.Popen(
                             entry["command"],
                             cwd=REPO_DIR,
                             stdout=handle,
                             stderr=subprocess.STDOUT,
                             text=True,
-                            check=False,
                         )
-                    returncode = int(proc.returncode)
+                        last_progress = None
+                        refresh_seconds = max(1.0, float(PROGRESS_REFRESH_SECONDS))
+                        while True:
+                            progress_payload = load_json_if_exists(progress_path)
+                            if progress_payload is not None:
+                                signature = progress_signature(progress_payload)
+                                if signature != last_progress:
+                                    print("  " + format_progress(progress_payload))
+                                    last_progress = signature
+
+                            returncode = proc.poll()
+                            if returncode is not None:
+                                break
+
+                            time.sleep(refresh_seconds)
+
+                    final_progress_payload = load_json_if_exists(progress_path)
+                    if final_progress_payload is not None:
+                        signature = progress_signature(final_progress_payload)
+                        if signature != last_progress:
+                            print("  " + format_progress(final_progress_payload))
 
                     if returncode != 0:
                         summary_rows.append(
@@ -651,6 +764,7 @@ def build_notebook() -> dict:
                     "lpips_mean": metric_mean(metrics, "lpips"),
                     "run_dir": entry["run_save_dir"],
                     "log_path": entry["log_path"],
+                    "progress_path": entry["progress_path"],
                     "metrics_path": existing_metrics_path.as_posix(),
                     "metric_history_path": existing_history_path.as_posix(),
                 }

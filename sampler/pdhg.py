@@ -790,6 +790,8 @@ class PDHG(nn.Module):
                measurement, evaluator=None,
                record=False, verbose=False, wandb=False,
                record_every: int = 1,
+               progress_callback=None,
+               progress_every: int | None = 1,
                trace_downsample_to: int | None = 64,
                print_summary: bool = True,
                **kwargs):
@@ -808,6 +810,7 @@ class PDHG(nn.Module):
         mode = self._mode(operator, measurement)
 
         K = self._effective_max_iter()
+        progress_every = int(progress_every or 0)
         pbar = tqdm.trange(K) if verbose else range(K)
 
         sigma_n = float(getattr(operator, "sigma", 0.05))
@@ -1153,6 +1156,7 @@ class PDHG(nn.Module):
             # Eval prints / wandb
             # =========================
             elapsed_seconds_per_image = (time.time() - start_time) / max(1, x_k.shape[0])
+            latest_metrics = {}
             if evaluator and 'gt' in kwargs:
                 with torch.no_grad():
                     gt = kwargs['gt']
@@ -1166,9 +1170,13 @@ class PDHG(nn.Module):
                 self._metric_history_add("theta", float(theta))
                 self._metric_history_add("elapsed_seconds_per_image", elapsed_seconds_per_image)
                 for metric_name, metric_value in z_k_results.items():
-                    self._metric_history_add(f"z_k_{metric_name}", metric_value.item())
+                    metric_scalar = metric_value.item()
+                    latest_metrics[f"z_k_{metric_name}"] = float(metric_scalar)
+                    self._metric_history_add(f"z_k_{metric_name}", metric_scalar)
                 for metric_name, metric_value in x_k_results.items():
-                    self._metric_history_add(f"x_k_{metric_name}", metric_value.item())
+                    metric_scalar = metric_value.item()
+                    latest_metrics[f"x_k_{metric_name}"] = float(metric_scalar)
+                    self._metric_history_add(f"x_k_{metric_name}", metric_scalar)
 
                 if verbose:
                     main = evaluator.main_eval_fn_name
@@ -1210,6 +1218,26 @@ class PDHG(nn.Module):
                     if prox_radial_resid is not None:
                         logd["prox_radial_resid"] = float(prox_radial_resid)
                     wnb.log(logd)
+
+            if (
+                progress_callback is not None and (
+                    step == 0
+                    or step + 1 == K
+                    or (progress_every > 0 and (step + 1) % progress_every == 0)
+                )
+            ):
+                progress_callback(
+                    sampler="PDHG",
+                    step=int(step + 1),
+                    max_iter=int(K),
+                    sigma=float(sigma_d),
+                    tau=float(tau_k),
+                    sigma_dual=float(self.sigma_dual),
+                    theta=float(theta),
+                    elapsed_seconds_total=float(time.time() - start_time),
+                    elapsed_seconds_per_image=float(elapsed_seconds_per_image),
+                    latest_metrics=latest_metrics,
+                )
 
         if record and print_summary:
             self._print_summary(start_time=start_time, recorded_iters=recorded_iters)
