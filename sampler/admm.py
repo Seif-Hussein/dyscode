@@ -306,7 +306,11 @@ class ADMM(nn.Module):
             if prior_use_type not in ["denoise"]:
                 raise Exception(f"Prior type {prior_use_type} not supported!!!")
 
-            z_ac = z_e + torch.randn_like(z_e) * sigma
+            ac_noise = bool(getattr(denoise_config, "ac_noise", True))
+            if ac_noise:
+                z_ac = z_e + torch.randn_like(z_e) * sigma
+            else:
+                z_ac = z_e
             z_dc = z_ac.clone()
 
             lr = denoise_config.lgvd.lr * sigma
@@ -616,6 +620,7 @@ class ADMM(nn.Module):
             x_k_old, z_k_old, u_k_old = x_k.clone(), z_k.clone(), u_k.clone()
 
             # evaluation (optional)
+            elapsed_seconds_per_image = (time.time() - start_time) / max(1, x_k.shape[0])
             if evaluator and 'gt' in kwargs:
                 with torch.no_grad():
                     gt = kwargs['gt']
@@ -625,6 +630,7 @@ class ADMM(nn.Module):
                 self._metric_history_add("step", step + 1)
                 self._metric_history_add("sigma", sigma)
                 self._metric_history_add("rho", float(self.admm_config.rho))
+                self._metric_history_add("elapsed_seconds_per_image", elapsed_seconds_per_image)
                 for metric_name, metric_value in x_k_results.items():
                     self._metric_history_add(f"x_k_{metric_name}", metric_value.item())
                 for metric_name, metric_value in z_k_results.items():

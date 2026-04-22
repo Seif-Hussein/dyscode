@@ -1152,6 +1152,7 @@ class PDHG(nn.Module):
             # =========================
             # Eval prints / wandb
             # =========================
+            elapsed_seconds_per_image = (time.time() - start_time) / max(1, x_k.shape[0])
             if evaluator and 'gt' in kwargs:
                 with torch.no_grad():
                     gt = kwargs['gt']
@@ -1163,6 +1164,7 @@ class PDHG(nn.Module):
                 self._metric_history_add("tau", float(tau_k))
                 self._metric_history_add("sigma_dual", float(self.sigma_dual))
                 self._metric_history_add("theta", float(theta))
+                self._metric_history_add("elapsed_seconds_per_image", elapsed_seconds_per_image)
                 for metric_name, metric_value in z_k_results.items():
                     self._metric_history_add(f"z_k_{metric_name}", metric_value.item())
                 for metric_name, metric_value in x_k_results.items():
