@@ -203,6 +203,16 @@ class ADMM(nn.Module):
     def get_metric_history(self):
         return self.metric_history
 
+    def _effective_max_iter(self) -> int:
+        max_iter = int(self.admm_config.max_iter)
+        early_stop = getattr(self.admm_config, "early_stop", None)
+        if early_stop is None:
+            return max_iter
+        early_stop = int(early_stop)
+        if early_stop <= 0:
+            return max_iter
+        return min(max_iter, early_stop)
+
     # -------------------------
     # ML / data subproblem
     # -------------------------
@@ -479,7 +489,8 @@ class ADMM(nn.Module):
             self.trace = None
             self.trajectory = None
 
-        pbar = tqdm.trange(self.admm_config.max_iter) if verbose else range(self.admm_config.max_iter)
+        max_iter = self._effective_max_iter()
+        pbar = tqdm.trange(max_iter) if verbose else range(max_iter)
 
         x_k, z_k, u_k = self.get_start(ref_img)
 

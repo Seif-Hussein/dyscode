@@ -217,6 +217,16 @@ class PDHG(nn.Module):
                 return [th for _ in range(K)]
         return [0.0 for _ in range(K)]
 
+    def _effective_max_iter(self) -> int:
+        max_iter = int(self.admm_config.max_iter)
+        early_stop = getattr(self.admm_config, "early_stop", None)
+        if early_stop is None:
+            return max_iter
+        early_stop = int(early_stop)
+        if early_stop <= 0:
+            return max_iter
+        return min(max_iter, early_stop)
+
     def _proj(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_projection:
             return x
@@ -797,7 +807,7 @@ class PDHG(nn.Module):
 
         mode = self._mode(operator, measurement)
 
-        K = int(self.admm_config.max_iter)
+        K = self._effective_max_iter()
         pbar = tqdm.trange(K) if verbose else range(K)
 
         sigma_n = float(getattr(operator, "sigma", 0.05))
