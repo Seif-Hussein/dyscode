@@ -84,6 +84,7 @@ def build_notebook() -> dict:
             SESSION_TAG = ""  #@param {type:"string"}
             CONFIG_NAME = "default_ffhq.yaml"  #@param ["default_ffhq.yaml"]
             INVERSE_TASK = "phase_retrieval"  #@param ["phase_retrieval", "phase_retrieval_explicit", "inpainting", "inpainting_explicit", "inpainting_rand", "inpainting_rand_explicit", "motion_blur", "motion_blur_explicit", "gaussian_blur", "gaussian_blur_explicit", "down_sampling", "down_sampling_explicit", "hdr", "hdr_explicit"]
+            RUN_SERIES = "both"  #@param ["both", "pdhg", "admm"]
 
             SEED = 99  #@param {type:"integer"}
             TOTAL_IMAGES = 20  #@param {type:"integer"}
@@ -259,12 +260,16 @@ def build_notebook() -> dict:
             if not metric_list:
                 raise ValueError("EVAL_METRICS must contain at least one metric name.")
 
-            pdhg_w_values = parse_int_list(PDHG_W_LIST)
-            admm_w_values = parse_int_list(ADMM_W_LIST)
-            if not pdhg_w_values:
-                raise ValueError("PDHG_W_LIST must contain at least one integer.")
-            if not admm_w_values:
-                raise ValueError("ADMM_W_LIST must contain at least one integer.")
+            run_series = str(RUN_SERIES).strip().lower()
+            if run_series not in {"both", "pdhg", "admm"}:
+                raise ValueError("RUN_SERIES must be one of: both, pdhg, admm")
+
+            pdhg_w_values = parse_int_list(PDHG_W_LIST) if run_series in {"both", "pdhg"} else []
+            admm_w_values = parse_int_list(ADMM_W_LIST) if run_series in {"both", "admm"} else []
+            if run_series in {"both", "pdhg"} and not pdhg_w_values:
+                raise ValueError("PDHG_W_LIST must contain at least one integer when RUN_SERIES includes PDHG.")
+            if run_series in {"both", "admm"} and not admm_w_values:
+                raise ValueError("ADMM_W_LIST must contain at least one integer when RUN_SERIES includes ADMM.")
 
             extra_overrides = parse_text_list(EXTRA_HYDRA_OVERRIDES)
             study_tag = SESSION_TAG.strip() or datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -342,41 +347,47 @@ def build_notebook() -> dict:
                 }
 
             plan = []
-            for W in pdhg_w_values:
-                plan.append(
-                    make_run_entry(
-                        series="PDHG",
-                        sampler_config="edm_pdhg",
-                        W=W,
-                        method_overrides=[
-                            f"sampler.annealing_scheduler_config.sigma_max={PDHG_SIGMA_MAX}",
-                            f"sampler.annealing_scheduler_config.sigma_min={PDHG_SIGMA_MIN}",
-                            "inverse_task.admm_config.denoise.lgvd.num_steps=0",
-                            f"++inverse_task.admm_config.pdhg.tau={PDHG_TAU}",
-                            f"++inverse_task.admm_config.pdhg.sigma_dual={PDHG_SIGMA_DUAL}",
-                        ],
+            if run_series in {"both", "pdhg"}:
+                for W in pdhg_w_values:
+                    plan.append(
+                        make_run_entry(
+                            series="PDHG",
+                            sampler_config="edm_pdhg",
+                            W=W,
+                            method_overrides=[
+                                f"sampler.annealing_scheduler_config.sigma_max={PDHG_SIGMA_MAX}",
+                                f"sampler.annealing_scheduler_config.sigma_min={PDHG_SIGMA_MIN}",
+                                "inverse_task.admm_config.denoise.lgvd.num_steps=0",
+                                f"++inverse_task.admm_config.pdhg.tau={PDHG_TAU}",
+                                f"++inverse_task.admm_config.pdhg.sigma_dual={PDHG_SIGMA_DUAL}",
+                            ],
+                        )
                     )
-                )
 
-            for W in admm_w_values:
-                plan.append(
-                    make_run_entry(
-                        series="AC-DC-ADMM",
-                        sampler_config="edm_admm",
-                        W=W,
-                        method_overrides=[
-                            f"sampler.annealing_scheduler_config.sigma_max={ADMM_SIGMA_MAX}",
-                            f"sampler.annealing_scheduler_config.sigma_min={ADMM_SIGMA_MIN}",
-                            f"inverse_task.admm_config.rho={ADMM_RHO}",
-                            f"inverse_task.admm_config.ml.lr={ADMM_ML_LR}",
-                            f"inverse_task.admm_config.denoise.lgvd.num_steps={ADMM_LGVD_NUM_STEPS}",
-                        ],
+            if run_series in {"both", "admm"}:
+                for W in admm_w_values:
+                    plan.append(
+                        make_run_entry(
+                            series="AC-DC-ADMM",
+                            sampler_config="edm_admm",
+                            W=W,
+                            method_overrides=[
+                                f"sampler.annealing_scheduler_config.sigma_max={ADMM_SIGMA_MAX}",
+                                f"sampler.annealing_scheduler_config.sigma_min={ADMM_SIGMA_MIN}",
+                                f"inverse_task.admm_config.rho={ADMM_RHO}",
+                                f"inverse_task.admm_config.ml.lr={ADMM_ML_LR}",
+                                f"inverse_task.admm_config.denoise.lgvd.num_steps={ADMM_LGVD_NUM_STEPS}",
+                            ],
+                        )
                     )
-                )
+
+            if not plan:
+                raise ValueError("No runs were scheduled. Check RUN_SERIES and the W lists.")
 
             study_context = {
                 "study_name": STUDY_NAME,
                 "study_tag": study_tag,
+                "run_series": run_series,
                 "study_root": study_root.as_posix(),
                 "run_root": run_root.as_posix(),
                 "context_path": context_path.as_posix(),
