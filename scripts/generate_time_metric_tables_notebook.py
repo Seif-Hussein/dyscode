@@ -33,9 +33,9 @@ def build_notebook() -> dict:
             """
             # Time-Metric Tables In Colab
 
-            This notebook runs a small FFHQ sweep for:
-            - `PDHG`
-            - `AC-DC-ADMM` (`sampler=edm_admm` with `lgvd.num_steps=10`)
+            This notebook can do either:
+            - a single anytime run, where one run is enough and the table shows how metrics evolve over time
+            - a small sweep, if you want multiple runs with different budgets
 
             It then builds tables that pair actual measured time per image with:
             - `PSNR`
@@ -48,7 +48,7 @@ def build_notebook() -> dict:
             - `PDHG`: `x_k`
             - `AC-DC-ADMM`: `z_k`
 
-            The defaults are intentionally conservative so the notebook is usable in Colab.
+            The default mode is the single-run anytime table, because that is often the most useful first view.
             For paper-style reporting, increase `TOTAL_IMAGES` to `100`.
             """
         ),
@@ -84,13 +84,16 @@ def build_notebook() -> dict:
             SESSION_TAG = ""  #@param {type:"string"}
             CONFIG_NAME = "default_ffhq.yaml"  #@param ["default_ffhq.yaml"]
             INVERSE_TASK = "phase_retrieval"  #@param ["phase_retrieval", "phase_retrieval_explicit", "inpainting", "inpainting_explicit", "inpainting_rand", "inpainting_rand_explicit", "motion_blur", "motion_blur_explicit", "gaussian_blur", "gaussian_blur_explicit", "down_sampling", "down_sampling_explicit", "hdr", "hdr_explicit"]
-            RUN_SERIES = "both"  #@param ["both", "pdhg", "admm"]
+            RUN_MODE = "single_run"  #@param ["single_run", "sweep"]
+            RUN_SERIES = "pdhg"  #@param ["pdhg", "admm", "both"]
 
             SEED = 99  #@param {type:"integer"}
             TOTAL_IMAGES = 20  #@param {type:"integer"}
             BATCH_SIZE = 1  #@param {type:"integer"}
             DATA_START_IDX = 0  #@param {type:"integer"}
 
+            PDHG_SINGLE_W = 400  #@param {type:"integer"}
+            ADMM_SINGLE_W = 40  #@param {type:"integer"}
             PDHG_W_LIST = "50,100,200,400"  #@param {type:"string"}
             ADMM_W_LIST = "5,10,20,40"  #@param {type:"string"}
 
@@ -260,16 +263,24 @@ def build_notebook() -> dict:
             if not metric_list:
                 raise ValueError("EVAL_METRICS must contain at least one metric name.")
 
+            run_mode = str(RUN_MODE).strip().lower()
+            if run_mode not in {"single_run", "sweep"}:
+                raise ValueError("RUN_MODE must be one of: single_run, sweep")
+
             run_series = str(RUN_SERIES).strip().lower()
             if run_series not in {"both", "pdhg", "admm"}:
                 raise ValueError("RUN_SERIES must be one of: both, pdhg, admm")
 
-            pdhg_w_values = parse_int_list(PDHG_W_LIST) if run_series in {"both", "pdhg"} else []
-            admm_w_values = parse_int_list(ADMM_W_LIST) if run_series in {"both", "admm"} else []
-            if run_series in {"both", "pdhg"} and not pdhg_w_values:
-                raise ValueError("PDHG_W_LIST must contain at least one integer when RUN_SERIES includes PDHG.")
-            if run_series in {"both", "admm"} and not admm_w_values:
-                raise ValueError("ADMM_W_LIST must contain at least one integer when RUN_SERIES includes ADMM.")
+            if run_mode == "single_run":
+                pdhg_w_values = [int(PDHG_SINGLE_W)] if run_series in {"both", "pdhg"} else []
+                admm_w_values = [int(ADMM_SINGLE_W)] if run_series in {"both", "admm"} else []
+            else:
+                pdhg_w_values = parse_int_list(PDHG_W_LIST) if run_series in {"both", "pdhg"} else []
+                admm_w_values = parse_int_list(ADMM_W_LIST) if run_series in {"both", "admm"} else []
+                if run_series in {"both", "pdhg"} and not pdhg_w_values:
+                    raise ValueError("PDHG_W_LIST must contain at least one integer when RUN_SERIES includes PDHG.")
+                if run_series in {"both", "admm"} and not admm_w_values:
+                    raise ValueError("ADMM_W_LIST must contain at least one integer when RUN_SERIES includes ADMM.")
 
             extra_overrides = parse_text_list(EXTRA_HYDRA_OVERRIDES)
             study_tag = SESSION_TAG.strip() or datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -387,6 +398,7 @@ def build_notebook() -> dict:
             study_context = {
                 "study_name": STUDY_NAME,
                 "study_tag": study_tag,
+                "run_mode": run_mode,
                 "run_series": run_series,
                 "study_root": study_root.as_posix(),
                 "run_root": run_root.as_posix(),
@@ -418,6 +430,8 @@ def build_notebook() -> dict:
 
             print(f"Study root: {study_root}")
             print(f"Context saved to: {context_path}")
+            print(f"Run mode: {run_mode}")
+            print(f"Run series: {run_series}")
             print()
             print("Example command:")
             print(" ".join(shlex.quote(part) for part in plan[0]["command"]))
@@ -746,49 +760,51 @@ def build_notebook() -> dict:
                         )
                     )
 
-                    print()
-                    print("PDHG:")
-                    display(
-                        ok_df[ok_df["series"] == "PDHG"][
-                            [
-                                "label",
-                                "W",
-                                "time_per_image_seconds",
-                                "psnr_mean",
-                                "ssim_mean",
-                                "lpips_mean",
-                            ]
-                        ].round(
-                            {
-                                "time_per_image_seconds": 4,
-                                "psnr_mean": 4,
-                                "ssim_mean": 4,
-                                "lpips_mean": 4,
-                            }
+                    if "PDHG" in ok_df["series"].tolist():
+                        print()
+                        print("PDHG:")
+                        display(
+                            ok_df[ok_df["series"] == "PDHG"][
+                                [
+                                    "label",
+                                    "W",
+                                    "time_per_image_seconds",
+                                    "psnr_mean",
+                                    "ssim_mean",
+                                    "lpips_mean",
+                                ]
+                            ].round(
+                                {
+                                    "time_per_image_seconds": 4,
+                                    "psnr_mean": 4,
+                                    "ssim_mean": 4,
+                                    "lpips_mean": 4,
+                                }
+                            )
                         )
-                    )
 
-                    print()
-                    print("AC-DC-ADMM:")
-                    display(
-                        ok_df[ok_df["series"] == "AC-DC-ADMM"][
-                            [
-                                "label",
-                                "W",
-                                "time_per_image_seconds",
-                                "psnr_mean",
-                                "ssim_mean",
-                                "lpips_mean",
-                            ]
-                        ].round(
-                            {
-                                "time_per_image_seconds": 4,
-                                "psnr_mean": 4,
-                                "ssim_mean": 4,
-                                "lpips_mean": 4,
-                            }
+                    if "AC-DC-ADMM" in ok_df["series"].tolist():
+                        print()
+                        print("AC-DC-ADMM:")
+                        display(
+                            ok_df[ok_df["series"] == "AC-DC-ADMM"][
+                                [
+                                    "label",
+                                    "W",
+                                    "time_per_image_seconds",
+                                    "psnr_mean",
+                                    "ssim_mean",
+                                    "lpips_mean",
+                                ]
+                            ].round(
+                                {
+                                    "time_per_image_seconds": 4,
+                                    "psnr_mean": 4,
+                                    "ssim_mean": 4,
+                                    "lpips_mean": 4,
+                                }
+                            )
                         )
-                    )
 
                 print()
                 print(f"JSON: {summary_path}")
@@ -882,11 +898,18 @@ def build_notebook() -> dict:
 
             Typical workflow:
             1. run the setup cells
-            2. build the sweep study
-            3. run or resume the sweep
-            4. inspect the final time-vs-metric table
-            5. inspect the per-run anytime tables
-            6. copy the study folder back to Drive
+            2. choose `RUN_MODE="single_run"` if you want one-run anytime tables
+            3. build the study
+            4. run or resume it
+            5. inspect the final time-vs-metric table
+            6. inspect the per-run anytime tables
+            7. copy the study folder back to Drive
+
+            Notes:
+            - `RUN_MODE="single_run"` with `RUN_SERIES="pdhg"` gives one PDHG run and its metric-vs-time table.
+            - `RUN_MODE="single_run"` with `RUN_SERIES="admm"` gives one AC-DC-ADMM run and its metric-vs-time table.
+            - `RUN_MODE="single_run"` with `RUN_SERIES="both"` gives one run per method.
+            - `RUN_MODE="sweep"` uses the `*_W_LIST` values to schedule multiple runs.
 
             The notebook writes:
             - `final_summary.json`
