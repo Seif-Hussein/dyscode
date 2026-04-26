@@ -34,6 +34,7 @@ class TransmissionCT(Operator):
                  attenuation_max=1.0,
                  eta=1.0,
                  I0=1.0e4,
+                 measurement_mode='poisson',
                  channels=1,
                  clamp_input=True,
                  sigma=1.0,
@@ -48,6 +49,7 @@ class TransmissionCT(Operator):
         self.attenuation_max = float(attenuation_max)
         self.eta = float(eta)
         self.I0 = float(I0)
+        self.measurement_mode = str(measurement_mode).lower()
         self.channels = int(channels)
         self.clamp_input = bool(clamp_input)
         self.device = device
@@ -105,6 +107,7 @@ class TransmissionCT(Operator):
         sino = self._resize_detector_axis(sino, self.num_detectors)
         return sino
 
+
     def __call__(self, x):
         mu = self._attenuation_image(x)
         return self._forward_mu(mu)
@@ -122,6 +125,13 @@ class TransmissionCT(Operator):
         z = self(x)
         rate = self.incident_counts(z) * torch.exp(-z).clamp_min(0.0)
         rate = rate.clamp_min(0.0).clamp_max(1.0e12)
+        if self.measurement_mode == 'expected':
+            return rate
+        if self.measurement_mode != 'poisson':
+            raise ValueError(
+                f"Unsupported transmission CT measurement_mode={self.measurement_mode!r}. "
+                "Expected one of: 'poisson', 'expected'."
+            )
         return torch.poisson(rate)
 
     def loss(self, x, y):

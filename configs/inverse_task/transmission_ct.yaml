@@ -74,4 +74,5 @@ operator:
   attenuation_max: 1.0
   eta: 1.0
   I0: 10000.0
+  measurement_mode: poisson
   sigma: 1.0
