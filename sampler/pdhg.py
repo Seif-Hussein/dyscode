@@ -81,11 +81,11 @@ class PDHG(nn.Module):
                  lgvd_config, admm_config, device='cuda', **kwargs):
         super().__init__()
 
+        self.admm_config = admm_config
         self.annealing_scheduler_config, self.diffusion_scheduler_config = \
             self._check(annealing_scheduler_config, diffusion_scheduler_config)
 
-        self.annealing_scheduler = Scheduler(**annealing_scheduler_config)
-        self.admm_config = admm_config
+        self.annealing_scheduler = Scheduler(**self.annealing_scheduler_config)
         self.device = device
 
         # ---- Diffusion parameters (only used if denoise.final_step == 'ode')
@@ -180,7 +180,71 @@ class PDHG(nn.Module):
     # -------------------------
     # Config helpers
     # -------------------------
+    def _pop_tail_config_value(self, cfg: dict, names: tuple[str, ...], default):
+        value = default
+        for name in names:
+            if name in cfg:
+                value = cfg.pop(name)
+
+        pdhg_cfg = getattr(self.admm_config, "pdhg", None)
+        if pdhg_cfg is not None:
+            for name in names:
+                if hasattr(pdhg_cfg, name):
+                    value = getattr(pdhg_cfg, name)
+        return value
+
     def _check(self, annealing_scheduler_config, diffusion_scheduler_config):
+        annealing_scheduler_config = dict(annealing_scheduler_config)
+        diffusion_scheduler_config = dict(diffusion_scheduler_config)
+
+        tail_steps = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("theorem1_tail_steps", "tail_steps"),
+            0,
+        )
+        rho_power = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("theorem1_tail_rho_power", "tail_rho_power"),
+            2.0,
+        )
+        rho_scale = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("theorem1_tail_rho_scale", "tail_rho_scale"),
+            1.0,
+        )
+        tail_lambda = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("theorem1_tail_lambda", "tail_lambda"),
+            None,
+        )
+        tail_sigma_mode = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("theorem1_tail_sigma_mode", "tail_sigma_mode"),
+            "theorem1",
+        )
+        tail_c = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("theorem1_tail_c", "tail_c"),
+            None,
+        )
+
+        self.theorem1_tail_steps = max(0, int(tail_steps or 0))
+        self.theorem1_tail_rho_power = float(rho_power if rho_power is not None else 2.0)
+        self.theorem1_tail_rho_scale = float(rho_scale if rho_scale is not None else 1.0)
+        if isinstance(tail_lambda, str) and tail_lambda.lower() in {"", "none", "null"}:
+            tail_lambda = None
+        self.theorem1_tail_lambda = None if tail_lambda is None else float(tail_lambda)
+        if self.theorem1_tail_lambda is not None and self.theorem1_tail_lambda <= 0.0:
+            raise ValueError("theorem1_tail_lambda must be positive when set.")
+        self.theorem1_tail_sigma_mode = str(tail_sigma_mode).lower()
+        if self.theorem1_tail_sigma_mode not in {"theorem1", "linear"}:
+            raise ValueError("theorem1_tail_sigma_mode must be 'theorem1' or 'linear'.")
+        if isinstance(tail_c, str) and tail_c.lower() in {"", "none", "null"}:
+            tail_c = None
+        self.theorem1_tail_c = None if tail_c is None else float(tail_c)
+        if self.theorem1_tail_c is not None and self.theorem1_tail_c <= 0.0:
+            raise ValueError("theorem1_tail_c must be positive when set.")
+
         if 'sigma_max' in diffusion_scheduler_config:
             diffusion_scheduler_config.pop('sigma_max')
         annealing_scheduler_config['sigma_final'] = 0
@@ -226,6 +290,64 @@ class PDHG(nn.Module):
         if early_stop <= 0:
             return max_iter
         return min(max_iter, early_stop)
+
+    def _build_sigma_tau_rho_schedule(self, total_steps: int):
+        sigma_steps = self.annealing_scheduler.sigma_steps
+        sigma_schedule = np.asarray(
+            [float(sigma_steps[min(k, self.annealing_scheduler.num_steps - 1)]) for k in range(total_steps)],
+            dtype=np.float64,
+        )
+        tau_schedule = np.full(total_steps, float(self.tau), dtype=np.float64)
+        rho_schedule = sigma_schedule.copy()
+        tail_mask = np.zeros(total_steps, dtype=bool)
+
+        tail_steps = min(int(self.theorem1_tail_steps), total_steps)
+        if tail_steps <= 0:
+            return sigma_schedule, tau_schedule, rho_schedule, tail_mask
+
+        switch_idx = total_steps - tail_steps
+        tail_intervals = total_steps - 1 - switch_idx
+        if tail_intervals <= 0:
+            return sigma_schedule, tau_schedule, rho_schedule, tail_mask
+
+        sigma_switch = float(sigma_schedule[switch_idx])
+        if sigma_switch <= 0.0:
+            return sigma_schedule, tau_schedule, rho_schedule, tail_mask
+
+        c = None
+        if self.theorem1_tail_sigma_mode == "theorem1":
+            if self.theorem1_tail_c is not None:
+                c = self.theorem1_tail_c
+            else:
+                sigma_end = float(sigma_schedule[-1])
+                sigma_floor = float(getattr(self.annealing_scheduler, "sigma_min", 0.0))
+                if sigma_end <= 0.0 < sigma_floor:
+                    sigma_end = sigma_floor
+
+                denom = sigma_switch ** 2 - sigma_end ** 2
+                if sigma_end <= 0.0 or denom <= 0.0:
+                    return sigma_schedule, tau_schedule, rho_schedule, tail_mask
+
+                c = tail_intervals * (sigma_end ** 2) / denom
+                if c <= 0.0:
+                    return sigma_schedule, tau_schedule, rho_schedule, tail_mask
+
+        rho_power = float(self.theorem1_tail_rho_power)
+        rho_scale = float(self.theorem1_tail_rho_scale)
+        tail_lambda = self.theorem1_tail_lambda
+        for k in range(switch_idx, total_steps):
+            n = k - switch_idx
+            if self.theorem1_tail_sigma_mode == "linear":
+                sigma_k = float(sigma_schedule[k])
+            else:
+                sigma_k = sigma_switch * math.sqrt(c / (c + n))
+            ratio = sigma_k / sigma_switch
+            sigma_schedule[k] = sigma_k
+            tau_schedule[k] = (sigma_k ** 2) / tail_lambda if tail_lambda is not None else float(self.tau) * (ratio ** 2)
+            rho_schedule[k] = rho_scale * sigma_switch * (ratio ** rho_power)
+            tail_mask[k] = True
+
+        return sigma_schedule, tau_schedule, rho_schedule, tail_mask
 
     def _proj(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_projection:
@@ -420,19 +542,27 @@ class PDHG(nn.Module):
     # -------------------------
     # Denoiser
     # -------------------------
-    def optimize_denoising(self, z_in, model, d_k, sigma, prior_use_type="denoise", wandb=False):
+    def optimize_denoising(self, z_in, model, d_k, sigma, rho=None, prior_use_type="denoise", wandb=False):
         denoise_config = self.admm_config.denoise
         with torch.no_grad():
             noisy_im = z_in.clone()
             sigma_batch = self._param_vector(sigma, noisy_im.shape[0], noisy_im.device, dtype=noisy_im.dtype)
             sigma_view = sigma_batch.reshape((-1,) + (1,) * (noisy_im.dim() - 1))
+            rho_batch = (
+                sigma_batch
+                if rho is None
+                else self._param_vector(rho, noisy_im.shape[0], noisy_im.device, dtype=noisy_im.dtype)
+            )
+            rho_view = rho_batch.reshape((-1,) + (1,) * (noisy_im.dim() - 1))
 
             if prior_use_type not in ["denoise"]:
                 raise Exception(f"Prior type {prior_use_type} not supported!!!")
 
             ac_noise = bool(getattr(denoise_config, "ac_noise", True))
-            if ac_noise:
-                forward_z = noisy_im + torch.randn_like(noisy_im) * sigma_view
+            ac_perturb = torch.zeros_like(noisy_im)
+            if ac_noise and bool(torch.any(rho_batch > 0).item()):
+                ac_perturb = torch.randn_like(noisy_im) * rho_view
+                forward_z = noisy_im + ac_perturb
             else:
                 forward_z = noisy_im
 
@@ -455,6 +585,8 @@ class PDHG(nn.Module):
 
             if denoise_config.final_step == 'tweedie':
                 z = model.tweedie(lgvd_z, sigma_batch)
+                if bool(getattr(denoise_config, "subtract_ac_noise", False)):
+                    z = z - ac_perturb
             elif denoise_config.final_step == 'ode':
                 if sigma_batch.numel() != 1 and not torch.allclose(sigma_batch, sigma_batch[0].expand_as(sigma_batch)):
                     raise NotImplementedError("Per-sample sigma schedules are only supported for final_step='tweedie'.")
@@ -682,6 +814,79 @@ class PDHG(nn.Module):
             return float((df.abs().pow(2).sum(dim=1).sqrt().mean().detach()) / math.sqrt(n))
 
     @staticmethod
+    def _phase_dual_theorem_stats(
+        w_k: torch.Tensor,
+        w_k1: torch.Tensor,
+        y_amp: torch.Tensor,
+        sigma_n: float,
+        sigma_dual: float,
+        eps: float = 1e-12,
+    ) -> dict[str, float]:
+        """
+        Scalar diagnostics for the theorem-style phase-retrieval dual bound
+
+            |w_i| <= (eta * y_i) / 2,  eta = 1 / sigma_n^2,  y_i > 0.
+
+        We aggregate across the active coordinates (y_i > 0) so the notebook can
+        monitor whether the tail appears compatible with the proposition without
+        saving the full complex dual tensors each iteration.
+        """
+        eta_pr = 1.0 / max(float(sigma_n) ** 2, eps)
+        stats = {
+            "pr_eta": float(eta_pr),
+            "pr_gamma_over_eta": float(float(sigma_dual) / eta_pr),
+            "pr_wk_norm": 0.0,
+            "pr_wk1_norm": 0.0,
+            "pr_wk_abs_max": 0.0,
+            "pr_wk1_abs_max": 0.0,
+            "pr_w_abs_max": 0.0,
+            "pr_bound_max": 0.0,
+            "pr_bound_min": 0.0,
+            "pr_w_bound_ratio_mean": 0.0,
+            "pr_w_bound_ratio_max": 0.0,
+            "pr_wk_bound_ratio_max": 0.0,
+            "pr_wk1_bound_ratio_max": 0.0,
+            "pr_w_bound_gap_min": 0.0,
+            "pr_w_bound_violation_frac": 0.0,
+            "pr_active_fraction": 0.0,
+        }
+
+        with torch.no_grad():
+            w_k_abs = w_k.abs()
+            w_k1_abs = w_k1.abs()
+            active_mask = y_amp > 0
+            stats["pr_wk_norm"] = PDHG._complex_norm_mean(w_k)
+            stats["pr_wk1_norm"] = PDHG._complex_norm_mean(w_k1)
+            stats["pr_active_fraction"] = float(active_mask.float().mean().detach())
+            if not bool(active_mask.any().item()):
+                return stats
+
+            active_w_k = w_k_abs[active_mask]
+            active_w_k1 = w_k1_abs[active_mask]
+            active_y = y_amp[active_mask]
+            bound = (0.5 * eta_pr * active_y).clamp_min(eps)
+            ratio_k = active_w_k / bound
+            ratio_k1 = active_w_k1 / bound
+            ratio = torch.cat([ratio_k.reshape(-1), ratio_k1.reshape(-1)], dim=0)
+            gap_k = bound - active_w_k
+            gap_k1 = bound - active_w_k1
+            gap = torch.cat([gap_k.reshape(-1), gap_k1.reshape(-1)], dim=0)
+
+            stats["pr_wk_abs_max"] = float(active_w_k.max().detach())
+            stats["pr_wk1_abs_max"] = float(active_w_k1.max().detach())
+            stats["pr_w_abs_max"] = float(max(stats["pr_wk_abs_max"], stats["pr_wk1_abs_max"]))
+            stats["pr_bound_max"] = float(bound.max().detach())
+            stats["pr_bound_min"] = float(bound.min().detach())
+            stats["pr_w_bound_ratio_mean"] = float(ratio.mean().detach())
+            stats["pr_w_bound_ratio_max"] = float(ratio.max().detach())
+            stats["pr_wk_bound_ratio_max"] = float(ratio_k.max().detach())
+            stats["pr_wk1_bound_ratio_max"] = float(ratio_k1.max().detach())
+            stats["pr_w_bound_gap_min"] = float(gap.min().detach())
+            stats["pr_w_bound_violation_frac"] = float((ratio > 1.0).float().mean().detach())
+
+        return stats
+
+    @staticmethod
     def _amp_resid(operator, x_m11: torch.Tensor, y_amp: torch.Tensor) -> float:
         """
         || |K(x01)| - y || / sqrt(n)
@@ -762,10 +967,17 @@ class PDHG(nn.Module):
 
         print("Scalar curves:")
         keys = [
-            "sigma",
+            "sigma", "rho",
             "delta",
             "tau", "sigma_dual", "theta",
             "p_norm", "p_step_norm",
+            "pr_eta", "pr_gamma_over_eta", "pr_wk_norm", "pr_wk1_norm",
+            "pr_wk_abs_max", "pr_wk1_abs_max", "pr_w_abs_max",
+            "pr_bound_max", "pr_bound_min",
+            "pr_w_bound_ratio_mean", "pr_w_bound_ratio_max",
+            "pr_wk_bound_ratio_max", "pr_wk1_bound_ratio_max",
+            "pr_w_bound_gap_min", "pr_w_bound_violation_frac",
+            "pr_active_fraction",
             "dual_inject_norm", "dual_inject_over_sigma",
             "amp_resid_z", "amp_resid_x",
             "z_misalign", "x_misalign",
@@ -852,69 +1064,24 @@ class PDHG(nn.Module):
         delta_pat = int(getattr(self.admm_config, "delta_patience", 0))
 
         recorded_iters = 0
-        # ---- step-size control params (tune these) ----
-        tau0 = float(self.tau)                 # baseline tau from config
-        sigma_dual0 = float(self.sigma_dual)   # baseline dual step from config
-        alpha_max = 5                        # cap for du/sigma (try 0.3, 0.5, 1.0)
-
-        # Optional PDHG stability coupling: tau*sigma_dual*||A||^2 <= theta0
-        use_stability_coupling = False
-        theta0 = 0.9                           # target product, < 1
-        normA_sq = None
-
-        # Estimate operator norm once if you want coupling.
-        # Your estimator returns ||K||^2 for phase retrieval (note: A = 0.5*K), and ||A||^2 for linear ops. 
-        if use_stability_coupling:
-            try:
-                normK_sq = self._estimate_norm_sq(operator, ref_img, mode=mode, iters=self.norm_power_iters)
-                normA_sq = 0.25 * normK_sq if mode == "phase_retrieval" else normK_sq  # A = 0.5*K in phase retrieval 
-            except Exception as e:
-                normA_sq = None
-                print(f"[PDHG] norm estimate failed, disabling coupling: {e}")
-                use_stability_coupling = False
-
-        # Baseline sigma0 from the schedule (used by coupled schedules)
-        sigma0 = float(self.annealing_scheduler.sigma_steps[0])
+        sigma_schedule, tau_schedule, rho_schedule, theorem1_tail_mask = self._build_sigma_tau_rho_schedule(K)
+        if bool(theorem1_tail_mask.any()):
+            switch_idx = int(np.flatnonzero(theorem1_tail_mask)[0])
+            print(
+                "[PDHG] theorem-1 tail active: "
+                f"steps={int(theorem1_tail_mask.sum())}, switch={switch_idx}, "
+                f"sigma_switch={sigma_schedule[switch_idx]:.6g}, "
+                f"sigma_mode={self.theorem1_tail_sigma_mode}, "
+                f"tail_c={self.theorem1_tail_c}, "
+                f"rho_power={self.theorem1_tail_rho_power:.3g}, "
+                f"lambda={self.theorem1_tail_lambda}"
+            )
 
         for step in pbar:
-            # denoiser sigma schedule
-            t_sigma = min(step, self.annealing_scheduler.num_steps - 1)
-            sigma_d = float(self.annealing_scheduler.sigma_steps[t_sigma])
-            """if sigma_d > 5:
-                self.tau = sigma_d**2*0.001
-            else:
-                #self.tau = sigma_d**2*0.1
-                self.tau = 0.001*(float(self.annealing_scheduler.sigma_steps[t_sigma-1])**2)/(float(self.annealing_scheduler.sigma_steps[t_sigma])**2)
-            tau_k = self.tau"""
-            #self.tau = min(0.01,sigma_d**2)
-            #self.sigma_dual = 1.01**step
-            #self.tau = 1/self.sigma_dual
-            #sigma_d = 1/math.sqrt(self.sigma_dual)
-            """if sigma_d < 0.75:
-                sigma_d  = 1/np.sqrt(t_sigma+1)
-                tau_k = sigma_d**2
-            else:
-                tau_k = self.tau"""
-            tau_k = self.tau
-            """rho_k = 0.001/sigma_d**2
-            self.tau = rho_k*0.01
-            self.sigma_dual = rho_k*100000
-            tau_k = self.tau
-            print('\n'+str(self.sigma_dual))"""
-           # self.tau
-            # --- continuation-style schedule (example) ---
-            """eta0 = 10
-            gamma_eta = 1.01  # >1
-            eta_k = eta0 * (gamma_eta ** step)
-
-            sigma_d = sigma0 / math.sqrt(eta_k)   # denoiser sigma decays ~ 1/sqrt(eta_k)
-            tau_k   = tau0 / eta_k                # coupling decays faster ~ 1/eta_k
-            sigma_dual_k = sigma_dual0 * eta_k    # keeps tau_k*sigma_dual_k approx constant (PDHG-style)
-            self.tau = float(tau_k)
-            self.sigma_dual = float(sigma_dual_k)
-            print(self.tau, self.sigma_dual,'\n')"""
-
-
+            sigma_d = float(sigma_schedule[step])
+            tau_k = float(tau_schedule[step])
+            rho_d = float(rho_schedule[step])
+            theorem1_tail_active = bool(theorem1_tail_mask[step])
             theta = 0.0 if self.force_theta_zero else float(self.theta_schedule[min(step, len(self.theta_schedule) - 1)])
 
             # =========================
@@ -968,9 +1135,17 @@ class PDHG(nn.Module):
             f_uk1 = self._f_value(mode, u_k1, measurement, sigma_n, operator=operator)
 
             # dual stats
+            pr_dual_stats = None
             if mode == "phase_retrieval":
                 p_norm = self._complex_norm_mean(p_k)
                 p_step_norm = self._complex_step_norm_mean(p_k, p_old)
+                pr_dual_stats = self._phase_dual_theorem_stats(
+                    w_k=p_old,
+                    w_k1=p_k,
+                    y_amp=measurement,
+                    sigma_n=sigma_n,
+                    sigma_dual=self.sigma_dual,
+                )
             else:
                 # real tensor dual
                 with torch.no_grad():
@@ -1034,6 +1209,7 @@ class PDHG(nn.Module):
                 model=model,
                 d_k=torch.zeros_like(z_k),
                 sigma=sigma_d,
+                rho=rho_d,
                 prior_use_type=self.admm_config.denoise.type,
                 wandb=wandb
             )
@@ -1092,6 +1268,7 @@ class PDHG(nn.Module):
                 self.trajectory.add_tensor('z_k', z_k)
                 self.trajectory.add_tensor('y_k', y_k)
                 self.trajectory.add_value('sigma', sigma_d)
+                self.trajectory.add_value('rho', rho_d)
                 self.trajectory.add_value('tau', float(tau_k))
                 self.trajectory.add_value('sigma_dual', float(self.sigma_dual))
                 self.trajectory.add_value('theta', float(theta))
@@ -1100,6 +1277,9 @@ class PDHG(nn.Module):
 
                 self.trajectory.add_value('p_norm', p_norm)
                 self.trajectory.add_value('p_step_norm', p_step_norm)
+                if pr_dual_stats is not None:
+                    for key, value in pr_dual_stats.items():
+                        self.trajectory.add_value(key, value)
 
                 self.trajectory.add_value('dual_inject_norm', dual_inject_norm)
                 self.trajectory.add_value('dual_inject_over_sigma', dual_inject_over_sigma)
@@ -1121,6 +1301,7 @@ class PDHG(nn.Module):
 
                 # trace dict
                 self._trace_add_value("sigma", sigma_d)
+                self._trace_add_value("rho", rho_d)
                 self._trace_add_value("tau", float(tau_k))
                 self._trace_add_value("sigma_dual", float(self.sigma_dual))
                 self._trace_add_value("theta", float(theta))
@@ -1129,6 +1310,9 @@ class PDHG(nn.Module):
 
                 self._trace_add_value("p_norm", p_norm)
                 self._trace_add_value("p_step_norm", p_step_norm)
+                if pr_dual_stats is not None:
+                    for key, value in pr_dual_stats.items():
+                        self._trace_add_value(key, value)
 
                 self._trace_add_value("dual_inject_norm", dual_inject_norm)
                 self._trace_add_value("dual_inject_over_sigma", dual_inject_over_sigma)
@@ -1165,10 +1349,18 @@ class PDHG(nn.Module):
 
                 self._metric_history_add("step", step + 1)
                 self._metric_history_add("sigma", sigma_d)
+                self._metric_history_add("rho", rho_d)
                 self._metric_history_add("tau", float(tau_k))
                 self._metric_history_add("sigma_dual", float(self.sigma_dual))
                 self._metric_history_add("theta", float(theta))
                 self._metric_history_add("elapsed_seconds_per_image", elapsed_seconds_per_image)
+                self._metric_history_add("p_norm", float(p_norm))
+                self._metric_history_add("p_step_norm", float(p_step_norm))
+                self._metric_history_add("dual_inject_norm", float(dual_inject_norm))
+                self._metric_history_add("dual_inject_over_sigma", float(dual_inject_over_sigma))
+                if pr_dual_stats is not None:
+                    for key, value in pr_dual_stats.items():
+                        self._metric_history_add(key, float(value))
                 for metric_name, metric_value in z_k_results.items():
                     metric_scalar = metric_value.item()
                     latest_metrics[f"z_k_{metric_name}"] = float(metric_scalar)
@@ -1177,6 +1369,9 @@ class PDHG(nn.Module):
                     metric_scalar = metric_value.item()
                     latest_metrics[f"x_k_{metric_name}"] = float(metric_scalar)
                     self._metric_history_add(f"x_k_{metric_name}", metric_scalar)
+                if pr_dual_stats is not None:
+                    latest_metrics["pr_w_bound_ratio_max"] = float(pr_dual_stats["pr_w_bound_ratio_max"])
+                    latest_metrics["pr_w_bound_violation_frac"] = float(pr_dual_stats["pr_w_bound_violation_frac"])
 
                 if verbose:
                     main = evaluator.main_eval_fn_name
@@ -1185,6 +1380,8 @@ class PDHG(nn.Module):
                         f'x_k_{main}': f"{x_k_results[main].item():.2f}",
                         "du/s": f"{dual_inject_over_sigma:.2e}",
                     }
+                    if pr_dual_stats is not None:
+                        postfix["w/b"] = f"{pr_dual_stats['pr_w_bound_ratio_max']:.2e}"
                     if z_misalign is not None:
                         postfix["z/s"] = f"{z_misalign:.2e}"
                     if x_misalign is not None:
@@ -1195,6 +1392,7 @@ class PDHG(nn.Module):
                     logd = {
                         "PDHG Iteration": step + 1,
                         "sigma": float(sigma_d),
+                        "rho": float(rho_d),
                         "tau": float(tau_k),
                         "sigma_dual": float(self.sigma_dual),
                         "theta": float(theta),
@@ -1217,6 +1415,8 @@ class PDHG(nn.Module):
                         logd["prox_move"] = float(prox_move)
                     if prox_radial_resid is not None:
                         logd["prox_radial_resid"] = float(prox_radial_resid)
+                    if pr_dual_stats is not None:
+                        logd.update({key: float(value) for key, value in pr_dual_stats.items()})
                     wnb.log(logd)
 
             if (
@@ -1231,12 +1431,15 @@ class PDHG(nn.Module):
                     step=int(step + 1),
                     max_iter=int(K),
                     sigma=float(sigma_d),
+                    rho=float(rho_d),
                     tau=float(tau_k),
                     sigma_dual=float(self.sigma_dual),
                     theta=float(theta),
+                    theorem1_tail_active=theorem1_tail_active,
                     elapsed_seconds_total=float(time.time() - start_time),
                     elapsed_seconds_per_image=float(elapsed_seconds_per_image),
                     latest_metrics=latest_metrics,
+                    phase_dual_stats=pr_dual_stats,
                 )
 
         if record and print_summary:
