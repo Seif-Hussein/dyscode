@@ -893,6 +893,73 @@ class PDHG(nn.Module):
         return stats
 
     @staticmethod
+    def _complex_segment_min_abs(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        """
+        Per-entry minimum distance to the origin along the complex line segment
+        (1 - t) a + t b,  t in [0, 1].
+        """
+        with torch.no_grad():
+            c = b - a
+            denom = c.abs().pow(2)
+            numer = -torch.real(torch.conj(c) * a)
+            t_star = torch.clamp(numer / denom.clamp_min(eps), 0.0, 1.0)
+            seg_point = a + t_star * c
+            seg_min = seg_point.abs()
+
+            endpoint_min = torch.minimum(a.abs(), b.abs())
+            return torch.where(denom <= eps, endpoint_min, seg_min)
+
+    @staticmethod
+    def _phase_ax_segment_stats(
+        ax_k: torch.Tensor,
+        z_k1: torch.Tensor,
+        y_amp: torch.Tensor,
+        sigma_n: float,
+        sigma_dual: float,
+        active_y_eps: float = 0.0,
+        eps: float = 1e-12,
+    ) -> dict[str, float]:
+        """
+        Empirical phase-retrieval smoothness diagnostic suggested by the finite-horizon
+        argument: compare the minimum distance of the segment between (A x^k)_i and
+        z_i^{k+1} to the critical PR radius 2 eta y_i / (gamma + 2 eta).
+        """
+        eta_pr = 1.0 / max(float(sigma_n) ** 2, eps)
+        gamma_pr = float(sigma_dual)
+        stats = {
+            "pr_ax_seg_crit_radius_min": 0.0,
+            "pr_ax_seg_crit_radius_max": 0.0,
+            "pr_ax_seg_dist_min": 0.0,
+            "pr_ax_seg_ratio_min": 0.0,
+            "pr_ax_seg_ratio_mean": 0.0,
+            "pr_ax_seg_margin_min": 0.0,
+            "pr_ax_seg_violation_frac": 0.0,
+        }
+
+        with torch.no_grad():
+            active_mask = y_amp > max(float(active_y_eps), 0.0)
+            if not bool(active_mask.any().item()):
+                return stats
+
+            active_ax = ax_k[active_mask]
+            active_z = z_k1[active_mask]
+            active_y = y_amp[active_mask]
+            crit_radius = (2.0 * eta_pr * active_y / (gamma_pr + 2.0 * eta_pr)).clamp_min(eps)
+            seg_min = PDHG._complex_segment_min_abs(active_ax, active_z, eps=eps)
+            ratio = seg_min / crit_radius
+            margin = seg_min - crit_radius
+
+            stats["pr_ax_seg_crit_radius_min"] = float(crit_radius.min().detach())
+            stats["pr_ax_seg_crit_radius_max"] = float(crit_radius.max().detach())
+            stats["pr_ax_seg_dist_min"] = float(seg_min.min().detach())
+            stats["pr_ax_seg_ratio_min"] = float(ratio.min().detach())
+            stats["pr_ax_seg_ratio_mean"] = float(ratio.mean().detach())
+            stats["pr_ax_seg_margin_min"] = float(margin.min().detach())
+            stats["pr_ax_seg_violation_frac"] = float((seg_min <= crit_radius).float().mean().detach())
+
+        return stats
+
+    @staticmethod
     def _amp_resid(operator, x_m11: torch.Tensor, y_amp: torch.Tensor) -> float:
         """
         || |K(x01)| - y || / sqrt(n)
@@ -984,6 +1051,9 @@ class PDHG(nn.Module):
             "pr_wk_bound_ratio_max", "pr_wk1_bound_ratio_max",
             "pr_w_bound_gap_min", "pr_w_bound_violation_frac",
             "pr_active_fraction",
+            "pr_ax_seg_crit_radius_min", "pr_ax_seg_crit_radius_max",
+            "pr_ax_seg_dist_min", "pr_ax_seg_ratio_min", "pr_ax_seg_ratio_mean",
+            "pr_ax_seg_margin_min", "pr_ax_seg_violation_frac",
             "dual_inject_norm", "dual_inject_over_sigma",
             "amp_resid_z", "amp_resid_x",
             "z_misalign", "x_misalign",
@@ -1152,6 +1222,20 @@ class PDHG(nn.Module):
                     sigma_n=sigma_n,
                     sigma_dual=self.sigma_dual,
                     active_y_eps=self.phase_dual_active_y_eps,
+                )
+                ax_k_for_segment = (
+                    u_bar if abs(theta) <= 1e-12
+                    else operator.forward_complex(self._to_01(x_k))
+                )
+                pr_dual_stats.update(
+                    self._phase_ax_segment_stats(
+                        ax_k=ax_k_for_segment,
+                        z_k1=u_k1,
+                        y_amp=measurement,
+                        sigma_n=sigma_n,
+                        sigma_dual=self.sigma_dual,
+                        active_y_eps=self.phase_dual_active_y_eps,
+                    )
                 )
             else:
                 # real tensor dual
