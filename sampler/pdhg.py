@@ -1143,10 +1143,17 @@ class PDHG(nn.Module):
         sigma_schedule, tau_schedule, rho_schedule, theorem1_tail_mask = self._build_sigma_tau_rho_schedule(K)
         if bool(theorem1_tail_mask.any()):
             switch_idx = int(np.flatnonzero(theorem1_tail_mask)[0])
+            prev_idx = max(0, switch_idx - 1)
+            next_idx = min(K - 1, switch_idx + 1)
             print(
                 "[PDHG] theorem-1 tail active: "
                 f"steps={int(theorem1_tail_mask.sum())}, switch={switch_idx}, "
+                f"sigma_prev={sigma_schedule[prev_idx]:.6g}, "
                 f"sigma_switch={sigma_schedule[switch_idx]:.6g}, "
+                f"sigma_next={sigma_schedule[next_idx]:.6g}, "
+                f"tau_prev={tau_schedule[prev_idx]:.6g}, "
+                f"tau_switch={tau_schedule[switch_idx]:.6g}, "
+                f"tau_next={tau_schedule[next_idx]:.6g}, "
                 f"sigma_mode={self.theorem1_tail_sigma_mode}, "
                 f"tail_c={self.theorem1_tail_c}, "
                 f"rho_power={self.theorem1_tail_rho_power:.3g}, "
