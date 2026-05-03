@@ -118,6 +118,10 @@ class PDHG(nn.Module):
                                    if getattr(self.admm_config, "proj", None) is not None else True)
 
         self.force_theta_zero = bool(getattr(pdhg_cfg, "force_theta_zero", False)) if pdhg_cfg is not None else False
+        self.phase_dual_active_y_eps = (
+            float(getattr(pdhg_cfg, "phase_dual_active_y_eps", 1e-12))
+            if pdhg_cfg is not None else 1e-12
+        )
 
         # Trace storage
         self.trace = None
@@ -820,6 +824,7 @@ class PDHG(nn.Module):
         y_amp: torch.Tensor,
         sigma_n: float,
         sigma_dual: float,
+        active_y_eps: float = 0.0,
         eps: float = 1e-12,
     ) -> dict[str, float]:
         """
@@ -835,6 +840,7 @@ class PDHG(nn.Module):
         stats = {
             "pr_eta": float(eta_pr),
             "pr_gamma_over_eta": float(float(sigma_dual) / eta_pr),
+            "pr_active_y_eps": float(active_y_eps),
             "pr_wk_norm": 0.0,
             "pr_wk1_norm": 0.0,
             "pr_wk_abs_max": 0.0,
@@ -854,7 +860,7 @@ class PDHG(nn.Module):
         with torch.no_grad():
             w_k_abs = w_k.abs()
             w_k1_abs = w_k1.abs()
-            active_mask = y_amp > 0
+            active_mask = y_amp > max(float(active_y_eps), 0.0)
             stats["pr_wk_norm"] = PDHG._complex_norm_mean(w_k)
             stats["pr_wk1_norm"] = PDHG._complex_norm_mean(w_k1)
             stats["pr_active_fraction"] = float(active_mask.float().mean().detach())
@@ -971,7 +977,7 @@ class PDHG(nn.Module):
             "delta",
             "tau", "sigma_dual", "theta",
             "p_norm", "p_step_norm",
-            "pr_eta", "pr_gamma_over_eta", "pr_wk_norm", "pr_wk1_norm",
+            "pr_eta", "pr_gamma_over_eta", "pr_active_y_eps", "pr_wk_norm", "pr_wk1_norm",
             "pr_wk_abs_max", "pr_wk1_abs_max", "pr_w_abs_max",
             "pr_bound_max", "pr_bound_min",
             "pr_w_bound_ratio_mean", "pr_w_bound_ratio_max",
@@ -1145,6 +1151,7 @@ class PDHG(nn.Module):
                     y_amp=measurement,
                     sigma_n=sigma_n,
                     sigma_dual=self.sigma_dual,
+                    active_y_eps=self.phase_dual_active_y_eps,
                 )
             else:
                 # real tensor dual
