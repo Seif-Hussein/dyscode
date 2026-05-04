@@ -960,6 +960,62 @@ class PDHG(nn.Module):
         return stats
 
     @staticmethod
+    def _ct_local_smoothness_stats(
+        operator,
+        a_k: torch.Tensor,
+        z_k1: torch.Tensor,
+        sigma_dual: float,
+        theta: float = 0.0,
+        eps: float = 1e-12,
+    ) -> dict[str, float]:
+        """
+        Empirical CT smoothness diagnostic on the segment used by the dual prox.
+
+        For h_CT(z) = eta * sum_i (I0_i exp(-z_i) + y_i z_i), the local Hessian
+        bound on the segment between a_k and z_{k+1} is
+
+            max_i eta * I0_i * exp(-min(a_{k,i}, z_{k+1,i})).
+
+        In this implementation a_k is the forward point used in the dual update
+        (operator(x_bar)). If theta=0, this is exactly A x^k.
+        """
+        stats = {
+            "ct_local_L": 0.0,
+            "ct_local_log_L": 0.0,
+            "ct_gamma_half": float(0.5 * float(sigma_dual)),
+            "ct_local_L_over_gamma_half": 0.0,
+            "ct_log_L_minus_log_gamma_half": 0.0,
+            "ct_local_condition_holds": 0.0,
+            "ct_segment_min": 0.0,
+            "ct_segment_max": 0.0,
+            "ct_segment_uses_xbar": float(abs(float(theta)) > 1e-12),
+        }
+
+        with torch.no_grad():
+            eta = float(getattr(operator, "eta", 1.0))
+            eta = max(eta, eps)
+            i0 = operator.incident_counts(z_k1).to(device=z_k1.device, dtype=z_k1.dtype).clamp_min(eps)
+            segment_min = torch.minimum(a_k.detach(), z_k1.detach())
+            log_terms = math.log(eta) + torch.log(i0) - segment_min
+            log_l = float(log_terms.max().detach())
+            gamma_half = max(0.5 * float(sigma_dual), eps)
+            log_gamma_half = math.log(gamma_half)
+            log_ratio = log_l - log_gamma_half
+
+            # Cap exponentials for JSON-friendly diagnostics. The uncapped
+            # comparison is still represented by log_ratio and condition_holds.
+            stats["ct_local_log_L"] = log_l
+            stats["ct_local_L"] = float(math.exp(min(log_l, 80.0)))
+            stats["ct_gamma_half"] = gamma_half
+            stats["ct_log_L_minus_log_gamma_half"] = log_ratio
+            stats["ct_local_L_over_gamma_half"] = float(math.exp(min(log_ratio, 80.0)))
+            stats["ct_local_condition_holds"] = float(log_l < log_gamma_half)
+            stats["ct_segment_min"] = float(segment_min.min().detach())
+            stats["ct_segment_max"] = float(torch.maximum(a_k.detach(), z_k1.detach()).max().detach())
+
+        return stats
+
+    @staticmethod
     def _amp_resid(operator, x_m11: torch.Tensor, y_amp: torch.Tensor) -> float:
         """
         || |K(x01)| - y || / sqrt(n)
@@ -1054,6 +1110,10 @@ class PDHG(nn.Module):
             "pr_ax_seg_crit_radius_min", "pr_ax_seg_crit_radius_max",
             "pr_ax_seg_dist_min", "pr_ax_seg_ratio_min", "pr_ax_seg_ratio_mean",
             "pr_ax_seg_margin_min", "pr_ax_seg_violation_frac",
+            "ct_local_L", "ct_local_log_L", "ct_gamma_half",
+            "ct_local_L_over_gamma_half", "ct_log_L_minus_log_gamma_half",
+            "ct_local_condition_holds", "ct_segment_min", "ct_segment_max",
+            "ct_segment_uses_xbar",
             "dual_inject_norm", "dual_inject_over_sigma",
             "amp_resid_z", "amp_resid_x",
             "z_misalign", "x_misalign",
@@ -1216,6 +1276,15 @@ class PDHG(nn.Module):
             # also get the proximal point u_{k+1} (optional, but useful)
             u_k1 = w - p_k / self.sigma_dual   # p_k is already p_new at this point
             f_uk1 = self._f_value(mode, u_k1, measurement, sigma_n, operator=operator)
+            ct_smooth_stats = None
+            if mode == "transmission_ct":
+                ct_smooth_stats = self._ct_local_smoothness_stats(
+                    operator=operator,
+                    a_k=z_bar,
+                    z_k1=u_k1,
+                    sigma_dual=self.sigma_dual,
+                    theta=theta,
+                )
 
             # dual stats
             pr_dual_stats = None
@@ -1378,6 +1447,9 @@ class PDHG(nn.Module):
                 if pr_dual_stats is not None:
                     for key, value in pr_dual_stats.items():
                         self.trajectory.add_value(key, value)
+                if ct_smooth_stats is not None:
+                    for key, value in ct_smooth_stats.items():
+                        self.trajectory.add_value(key, value)
 
                 self.trajectory.add_value('dual_inject_norm', dual_inject_norm)
                 self.trajectory.add_value('dual_inject_over_sigma', dual_inject_over_sigma)
@@ -1410,6 +1482,9 @@ class PDHG(nn.Module):
                 self._trace_add_value("p_step_norm", p_step_norm)
                 if pr_dual_stats is not None:
                     for key, value in pr_dual_stats.items():
+                        self._trace_add_value(key, value)
+                if ct_smooth_stats is not None:
+                    for key, value in ct_smooth_stats.items():
                         self._trace_add_value(key, value)
 
                 self._trace_add_value("dual_inject_norm", dual_inject_norm)
@@ -1459,6 +1534,9 @@ class PDHG(nn.Module):
                 if pr_dual_stats is not None:
                     for key, value in pr_dual_stats.items():
                         self._metric_history_add(key, float(value))
+                if ct_smooth_stats is not None:
+                    for key, value in ct_smooth_stats.items():
+                        self._metric_history_add(key, float(value))
                 for metric_name, metric_value in z_k_results.items():
                     metric_scalar = metric_value.item()
                     latest_metrics[f"z_k_{metric_name}"] = float(metric_scalar)
@@ -1470,6 +1548,13 @@ class PDHG(nn.Module):
                 if pr_dual_stats is not None:
                     latest_metrics["pr_w_bound_ratio_max"] = float(pr_dual_stats["pr_w_bound_ratio_max"])
                     latest_metrics["pr_w_bound_violation_frac"] = float(pr_dual_stats["pr_w_bound_violation_frac"])
+                if ct_smooth_stats is not None:
+                    latest_metrics["ct_local_L_over_gamma_half"] = float(
+                        ct_smooth_stats["ct_local_L_over_gamma_half"]
+                    )
+                    latest_metrics["ct_local_condition_holds"] = float(
+                        ct_smooth_stats["ct_local_condition_holds"]
+                    )
 
                 if verbose:
                     main = evaluator.main_eval_fn_name
@@ -1480,6 +1565,8 @@ class PDHG(nn.Module):
                     }
                     if pr_dual_stats is not None:
                         postfix["w/b"] = f"{pr_dual_stats['pr_w_bound_ratio_max']:.2e}"
+                    if ct_smooth_stats is not None:
+                        postfix["L/g"] = f"{ct_smooth_stats['ct_local_L_over_gamma_half']:.2e}"
                     if z_misalign is not None:
                         postfix["z/s"] = f"{z_misalign:.2e}"
                     if x_misalign is not None:
@@ -1515,6 +1602,8 @@ class PDHG(nn.Module):
                         logd["prox_radial_resid"] = float(prox_radial_resid)
                     if pr_dual_stats is not None:
                         logd.update({key: float(value) for key, value in pr_dual_stats.items()})
+                    if ct_smooth_stats is not None:
+                        logd.update({key: float(value) for key, value in ct_smooth_stats.items()})
                     wnb.log(logd)
 
             if (
@@ -1538,6 +1627,7 @@ class PDHG(nn.Module):
                     elapsed_seconds_per_image=float(elapsed_seconds_per_image),
                     latest_metrics=latest_metrics,
                     phase_dual_stats=pr_dual_stats,
+                    ct_smoothness_stats=ct_smooth_stats,
                 )
 
         if record and print_summary:
