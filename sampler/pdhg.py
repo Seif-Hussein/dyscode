@@ -914,6 +914,12 @@ class PDHG(nn.Module):
             |a_i^k| >= ((eta + gamma * alpha) / (gamma + eta)) * y_i
 
         on the active coordinates y_i > active_y_eps.
+
+        Here a_k and u_k should be the actual measurement-space quantities used by
+        the phase prox:
+
+            a_k = prox center,
+            u_k = prox input = a_k + w_k / gamma.
         """
         eta_pr = 1.0 / max(float(sigma_n) ** 2, eps)
         gamma_pr = float(sigma_dual)
@@ -1234,6 +1240,7 @@ class PDHG(nn.Module):
             "pr_w_bound_gap_min", "pr_w_bound_violation_frac",
             "pr_active_fraction",
             "pr_alpha_user", "pr_alpha_min_required", "pr_alpha_admissible", "pr_alpha_a_required",
+            "pr_alpha_uses_actual_prox_input",
             "pr_alpha_u_ratio_min", "pr_alpha_u_ratio_mean",
             "pr_alpha_a_ratio_min", "pr_alpha_a_ratio_mean",
             "pr_alpha_u_margin_min", "pr_alpha_a_margin_min",
@@ -1439,11 +1446,12 @@ class PDHG(nn.Module):
                     u_bar if abs(theta) <= 1e-12
                     else operator.forward_complex(self._to_01(x_k))
                 )
-                u_k_theorem = ax_k_for_segment + (p_old / self.sigma_dual)
+                pr_alpha_anchor = u_bar
+                pr_alpha_input = w
                 pr_dual_stats.update(
                     self._phase_alpha_tail_stats(
-                        a_k=ax_k_for_segment,
-                        u_k=u_k_theorem,
+                        a_k=pr_alpha_anchor,
+                        u_k=pr_alpha_input,
                         y_amp=measurement,
                         sigma_n=sigma_n,
                         sigma_dual=self.sigma_dual,
@@ -1451,6 +1459,7 @@ class PDHG(nn.Module):
                         active_y_eps=self.phase_dual_active_y_eps,
                     )
                 )
+                pr_dual_stats["pr_alpha_uses_actual_prox_input"] = 1.0
                 pr_dual_stats.update(
                     self._phase_ax_segment_stats(
                         ax_k=ax_k_for_segment,
