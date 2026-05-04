@@ -122,6 +122,10 @@ class PDHG(nn.Module):
             float(getattr(pdhg_cfg, "phase_dual_active_y_eps", 1e-12))
             if pdhg_cfg is not None else 1e-12
         )
+        self.phase_pr_alpha = (
+            float(getattr(pdhg_cfg, "phase_pr_alpha", 0.25))
+            if pdhg_cfg is not None else 0.25
+        )
 
         # Trace storage
         self.trace = None
@@ -893,6 +897,77 @@ class PDHG(nn.Module):
         return stats
 
     @staticmethod
+    def _phase_alpha_tail_stats(
+        a_k: torch.Tensor,
+        u_k: torch.Tensor,
+        y_amp: torch.Tensor,
+        sigma_n: float,
+        sigma_dual: float,
+        alpha: float,
+        active_y_eps: float = 0.0,
+        eps: float = 1e-12,
+    ) -> dict[str, float]:
+        """
+        Diagnostics for the simpler phase-retrieval nondegenerate-tail condition:
+
+            |u_i^k| >= alpha * y_i,
+            |a_i^k| >= ((eta + gamma * alpha) / (gamma + eta)) * y_i
+
+        on the active coordinates y_i > active_y_eps.
+        """
+        eta_pr = 1.0 / max(float(sigma_n) ** 2, eps)
+        gamma_pr = float(sigma_dual)
+        alpha_user = max(float(alpha), 0.0)
+        alpha_min_required = eta_pr / (gamma_pr + 2.0 * eta_pr)
+        a_required = (eta_pr + gamma_pr * alpha_user) / (gamma_pr + eta_pr)
+        stats = {
+            "pr_alpha_user": float(alpha_user),
+            "pr_alpha_min_required": float(alpha_min_required),
+            "pr_alpha_admissible": float(alpha_user > alpha_min_required),
+            "pr_alpha_a_required": float(a_required),
+            "pr_alpha_u_ratio_min": 0.0,
+            "pr_alpha_u_ratio_mean": 0.0,
+            "pr_alpha_a_ratio_min": 0.0,
+            "pr_alpha_a_ratio_mean": 0.0,
+            "pr_alpha_u_margin_min": 0.0,
+            "pr_alpha_a_margin_min": 0.0,
+            "pr_alpha_u_violation_frac": 0.0,
+            "pr_alpha_a_violation_frac": 0.0,
+            "pr_alpha_combined_violation_frac": 0.0,
+            "pr_alpha_u_abs_min": 0.0,
+            "pr_alpha_a_abs_min": 0.0,
+        }
+
+        with torch.no_grad():
+            active_mask = y_amp > max(float(active_y_eps), 0.0)
+            if not bool(active_mask.any().item()):
+                return stats
+
+            active_y = y_amp[active_mask].clamp_min(eps)
+            u_ratio = u_k.abs()[active_mask] / active_y
+            a_ratio = a_k.abs()[active_mask] / active_y
+
+            u_margin = u_ratio - alpha_user
+            a_margin = a_ratio - a_required
+            u_bad = u_ratio < alpha_user
+            a_bad = a_ratio < a_required
+            combined_bad = torch.logical_or(u_bad, a_bad)
+
+            stats["pr_alpha_u_ratio_min"] = float(u_ratio.min().detach())
+            stats["pr_alpha_u_ratio_mean"] = float(u_ratio.mean().detach())
+            stats["pr_alpha_a_ratio_min"] = float(a_ratio.min().detach())
+            stats["pr_alpha_a_ratio_mean"] = float(a_ratio.mean().detach())
+            stats["pr_alpha_u_margin_min"] = float(u_margin.min().detach())
+            stats["pr_alpha_a_margin_min"] = float(a_margin.min().detach())
+            stats["pr_alpha_u_violation_frac"] = float(u_bad.float().mean().detach())
+            stats["pr_alpha_a_violation_frac"] = float(a_bad.float().mean().detach())
+            stats["pr_alpha_combined_violation_frac"] = float(combined_bad.float().mean().detach())
+            stats["pr_alpha_u_abs_min"] = float(u_k.abs()[active_mask].min().detach())
+            stats["pr_alpha_a_abs_min"] = float(a_k.abs()[active_mask].min().detach())
+
+        return stats
+
+    @staticmethod
     def _complex_segment_min_abs(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
         """
         Per-entry minimum distance to the origin along the complex line segment
@@ -1158,6 +1233,13 @@ class PDHG(nn.Module):
             "pr_wk_bound_ratio_max", "pr_wk1_bound_ratio_max",
             "pr_w_bound_gap_min", "pr_w_bound_violation_frac",
             "pr_active_fraction",
+            "pr_alpha_user", "pr_alpha_min_required", "pr_alpha_admissible", "pr_alpha_a_required",
+            "pr_alpha_u_ratio_min", "pr_alpha_u_ratio_mean",
+            "pr_alpha_a_ratio_min", "pr_alpha_a_ratio_mean",
+            "pr_alpha_u_margin_min", "pr_alpha_a_margin_min",
+            "pr_alpha_u_violation_frac", "pr_alpha_a_violation_frac",
+            "pr_alpha_combined_violation_frac",
+            "pr_alpha_u_abs_min", "pr_alpha_a_abs_min",
             "pr_ax_seg_crit_radius_min", "pr_ax_seg_crit_radius_max",
             "pr_ax_seg_dist_min", "pr_ax_seg_ratio_min", "pr_ax_seg_ratio_mean",
             "pr_ax_seg_margin_min", "pr_ax_seg_violation_frac",
@@ -1356,6 +1438,18 @@ class PDHG(nn.Module):
                 ax_k_for_segment = (
                     u_bar if abs(theta) <= 1e-12
                     else operator.forward_complex(self._to_01(x_k))
+                )
+                u_k_theorem = ax_k_for_segment + (p_old / self.sigma_dual)
+                pr_dual_stats.update(
+                    self._phase_alpha_tail_stats(
+                        a_k=ax_k_for_segment,
+                        u_k=u_k_theorem,
+                        y_amp=measurement,
+                        sigma_n=sigma_n,
+                        sigma_dual=self.sigma_dual,
+                        alpha=self.phase_pr_alpha,
+                        active_y_eps=self.phase_dual_active_y_eps,
+                    )
                 )
                 pr_dual_stats.update(
                     self._phase_ax_segment_stats(
