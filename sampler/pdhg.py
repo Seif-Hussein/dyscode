@@ -126,6 +126,42 @@ class PDHG(nn.Module):
             float(getattr(pdhg_cfg, "phase_pr_alpha", 0.25))
             if pdhg_cfg is not None else 0.25
         )
+        self.sigma_dual_schedule_mode = (
+            str(getattr(pdhg_cfg, "sigma_dual_schedule_mode", "constant")).lower()
+            if pdhg_cfg is not None else "constant"
+        )
+        if self.sigma_dual_schedule_mode not in {"constant", "to_zero", "to_infinity"}:
+            raise ValueError("sigma_dual_schedule_mode must be 'constant', 'to_zero', or 'to_infinity'.")
+        self.sigma_dual_schedule_scope = (
+            str(getattr(pdhg_cfg, "sigma_dual_schedule_scope", "full")).lower()
+            if pdhg_cfg is not None else "full"
+        )
+        if self.sigma_dual_schedule_scope not in {"full", "tail"}:
+            raise ValueError("sigma_dual_schedule_scope must be 'full' or 'tail'.")
+        self.sigma_dual_schedule_power = (
+            float(getattr(pdhg_cfg, "sigma_dual_schedule_power", 1.0))
+            if pdhg_cfg is not None else 1.0
+        )
+        if self.sigma_dual_schedule_power <= 0.0:
+            raise ValueError("sigma_dual_schedule_power must be positive.")
+        sigma_dual_schedule_min = getattr(pdhg_cfg, "sigma_dual_schedule_min", 1e-8) if pdhg_cfg is not None else 1e-8
+        sigma_dual_schedule_max = getattr(pdhg_cfg, "sigma_dual_schedule_max", None) if pdhg_cfg is not None else None
+        if isinstance(sigma_dual_schedule_min, str) and sigma_dual_schedule_min.lower() in {"", "none", "null"}:
+            sigma_dual_schedule_min = None
+        if isinstance(sigma_dual_schedule_max, str) and sigma_dual_schedule_max.lower() in {"", "none", "null"}:
+            sigma_dual_schedule_max = None
+        self.sigma_dual_schedule_min = None if sigma_dual_schedule_min is None else float(sigma_dual_schedule_min)
+        self.sigma_dual_schedule_max = None if sigma_dual_schedule_max is None else float(sigma_dual_schedule_max)
+        if self.sigma_dual_schedule_min is not None and self.sigma_dual_schedule_min <= 0.0:
+            raise ValueError("sigma_dual_schedule_min must be positive when set.")
+        if self.sigma_dual_schedule_max is not None and self.sigma_dual_schedule_max <= 0.0:
+            raise ValueError("sigma_dual_schedule_max must be positive when set.")
+        if (
+            self.sigma_dual_schedule_min is not None
+            and self.sigma_dual_schedule_max is not None
+            and self.sigma_dual_schedule_min > self.sigma_dual_schedule_max
+        ):
+            raise ValueError("sigma_dual_schedule_min cannot exceed sigma_dual_schedule_max.")
 
         # Trace storage
         self.trace = None
@@ -356,6 +392,43 @@ class PDHG(nn.Module):
             tail_mask[k] = True
 
         return sigma_schedule, tau_schedule, rho_schedule, tail_mask
+
+    def _build_sigma_dual_schedule(self, sigma_schedule: np.ndarray, tail_mask: np.ndarray):
+        total_steps = int(len(sigma_schedule))
+        sigma_dual_schedule = np.full(total_steps, float(self.sigma_dual), dtype=np.float64)
+        mode = self.sigma_dual_schedule_mode
+        if mode == "constant" or total_steps <= 0:
+            return sigma_dual_schedule
+
+        if self.sigma_dual_schedule_scope == "tail":
+            active_mask = np.asarray(tail_mask, dtype=bool).copy()
+            if not bool(active_mask.any()):
+                return sigma_dual_schedule
+        else:
+            active_mask = np.ones(total_steps, dtype=bool)
+
+        anchor_idx = int(np.flatnonzero(active_mask)[0])
+        anchor_sigma = max(float(sigma_schedule[anchor_idx]), 1e-12)
+        base_gamma = max(float(self.sigma_dual), 1e-12)
+        power = float(self.sigma_dual_schedule_power)
+
+        for k in range(anchor_idx, total_steps):
+            if not active_mask[k]:
+                continue
+            sigma_k = max(float(sigma_schedule[k]), 1e-12)
+            ratio = sigma_k / anchor_sigma
+            if mode == "to_zero":
+                gamma_k = base_gamma * (ratio ** power)
+            else:
+                gamma_k = base_gamma * ((anchor_sigma / sigma_k) ** power)
+
+            if self.sigma_dual_schedule_min is not None:
+                gamma_k = max(gamma_k, float(self.sigma_dual_schedule_min))
+            if self.sigma_dual_schedule_max is not None:
+                gamma_k = min(gamma_k, float(self.sigma_dual_schedule_max))
+            sigma_dual_schedule[k] = gamma_k
+
+        return sigma_dual_schedule
 
     def _proj(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_projection:
@@ -1344,6 +1417,7 @@ class PDHG(nn.Module):
 
         recorded_iters = 0
         sigma_schedule, tau_schedule, rho_schedule, theorem1_tail_mask = self._build_sigma_tau_rho_schedule(K)
+        sigma_dual_schedule = self._build_sigma_dual_schedule(sigma_schedule, theorem1_tail_mask)
         if bool(theorem1_tail_mask.any()):
             switch_idx = int(np.flatnonzero(theorem1_tail_mask)[0])
             prev_idx = max(0, switch_idx - 1)
@@ -1362,11 +1436,32 @@ class PDHG(nn.Module):
                 f"rho_power={self.theorem1_tail_rho_power:.3g}, "
                 f"lambda={self.theorem1_tail_lambda}"
             )
+        if self.sigma_dual_schedule_mode != "constant":
+            if self.sigma_dual_schedule_scope == "tail" and not bool(theorem1_tail_mask.any()):
+                print(
+                    "[PDHG] adaptive sigma_dual requested with scope=tail, "
+                    "but no tail is active; using constant sigma_dual."
+                )
+            else:
+                gamma_anchor_idx = 0
+                if self.sigma_dual_schedule_scope == "tail" and bool(theorem1_tail_mask.any()):
+                    gamma_anchor_idx = int(np.flatnonzero(theorem1_tail_mask)[0])
+                gamma_next_idx = min(K - 1, gamma_anchor_idx + 1)
+                print(
+                    "[PDHG] adaptive sigma_dual active: "
+                    f"mode={self.sigma_dual_schedule_mode}, scope={self.sigma_dual_schedule_scope}, "
+                    f"power={self.sigma_dual_schedule_power:.3g}, "
+                    f"gamma_anchor={sigma_dual_schedule[gamma_anchor_idx]:.6g}, "
+                    f"gamma_next={sigma_dual_schedule[gamma_next_idx]:.6g}, "
+                    f"gamma_final={sigma_dual_schedule[-1]:.6g}, "
+                    f"gamma_min={self.sigma_dual_schedule_min}, gamma_max={self.sigma_dual_schedule_max}"
+                )
 
         for step in pbar:
             sigma_d = float(sigma_schedule[step])
             tau_k = float(tau_schedule[step])
             rho_d = float(rho_schedule[step])
+            sigma_dual_k = float(sigma_dual_schedule[step])
             theorem1_tail_active = bool(theorem1_tail_mask[step])
             theta = 0.0 if self.force_theta_zero else float(self.theta_schedule[min(step, len(self.theta_schedule) - 1)])
 
@@ -1383,7 +1478,7 @@ class PDHG(nn.Module):
                     p=p_k,
                     u_bar=u_bar,
                     y_amp=measurement,
-                    sigma_dual=self.sigma_dual,
+                    sigma_dual=sigma_dual_k,
                     sigma_n=sigma_n
                 )
             elif mode == "transmission_ct":
@@ -1392,7 +1487,7 @@ class PDHG(nn.Module):
                     p=p_k,
                     z_bar=z_bar,
                     y_counts=measurement,
-                    sigma_dual=self.sigma_dual,
+                    sigma_dual=sigma_dual_k,
                     operator=operator,
                 )
             else:
@@ -1401,23 +1496,23 @@ class PDHG(nn.Module):
                     p=p_k,
                     Ax_bar=Ax_bar,
                     y=measurement,
-                    sigma_dual=self.sigma_dual,
+                    sigma_dual=sigma_dual_k,
                     sigma_n=sigma_n
                 )
 
             p_k = p_new
             # v_k in the paper corresponds to w here:
             if mode == "phase_retrieval":
-                w = (p_old + self.sigma_dual * u_bar) / self.sigma_dual
+                w = (p_old + sigma_dual_k * u_bar) / sigma_dual_k
             elif mode == "transmission_ct":
-                w = (p_old + self.sigma_dual * z_bar) / self.sigma_dual
+                w = (p_old + sigma_dual_k * z_bar) / sigma_dual_k
             else:
-                w = (p_old + self.sigma_dual * Ax_bar) / self.sigma_dual
+                w = (p_old + sigma_dual_k * Ax_bar) / sigma_dual_k
 
             f_vk = self._f_value(mode, w, measurement, sigma_n, operator=operator)
 
             # also get the proximal point u_{k+1} (optional, but useful)
-            u_k1 = w - p_k / self.sigma_dual   # p_k is already p_new at this point
+            u_k1 = w - p_k / sigma_dual_k   # p_k is already p_new at this point
             f_uk1 = self._f_value(mode, u_k1, measurement, sigma_n, operator=operator)
             ct_smooth_stats = None
             if mode == "transmission_ct":
@@ -1425,7 +1520,7 @@ class PDHG(nn.Module):
                     operator=operator,
                     a_k=z_bar,
                     z_k1=u_k1,
-                    sigma_dual=self.sigma_dual,
+                    sigma_dual=sigma_dual_k,
                     theta=theta,
                 )
 
@@ -1439,7 +1534,7 @@ class PDHG(nn.Module):
                     w_k1=p_k,
                     y_amp=measurement,
                     sigma_n=sigma_n,
-                    sigma_dual=self.sigma_dual,
+                    sigma_dual=sigma_dual_k,
                     active_y_eps=self.phase_dual_active_y_eps,
                 )
                 ax_k_for_segment = (
@@ -1454,7 +1549,7 @@ class PDHG(nn.Module):
                         u_k=pr_alpha_input,
                         y_amp=measurement,
                         sigma_n=sigma_n,
-                        sigma_dual=self.sigma_dual,
+                        sigma_dual=sigma_dual_k,
                         alpha=self.phase_pr_alpha,
                         active_y_eps=self.phase_dual_active_y_eps,
                     )
@@ -1466,7 +1561,7 @@ class PDHG(nn.Module):
                         z_k1=u_k1,
                         y_amp=measurement,
                         sigma_n=sigma_n,
-                        sigma_dual=self.sigma_dual,
+                        sigma_dual=sigma_dual_k,
                         active_y_eps=self.phase_dual_active_y_eps,
                     )
                 )
@@ -1557,7 +1652,7 @@ class PDHG(nn.Module):
                             ax_k1=Kxk,
                             y_amp=measurement,
                             sigma_n=sigma_n,
-                            sigma_dual=self.sigma_dual,
+                            sigma_dual=sigma_dual_k,
                             active_y_eps=self.phase_dual_active_y_eps,
                         )
                     )
@@ -1605,7 +1700,7 @@ class PDHG(nn.Module):
                 self.trajectory.add_value('sigma', sigma_d)
                 self.trajectory.add_value('rho', rho_d)
                 self.trajectory.add_value('tau', float(tau_k))
-                self.trajectory.add_value('sigma_dual', float(self.sigma_dual))
+                self.trajectory.add_value('sigma_dual', float(sigma_dual_k))
                 self.trajectory.add_value('theta', float(theta))
                 if delta is not None:
                     self.trajectory.add_value('delta', delta)
@@ -1641,7 +1736,7 @@ class PDHG(nn.Module):
                 self._trace_add_value("sigma", sigma_d)
                 self._trace_add_value("rho", rho_d)
                 self._trace_add_value("tau", float(tau_k))
-                self._trace_add_value("sigma_dual", float(self.sigma_dual))
+                self._trace_add_value("sigma_dual", float(sigma_dual_k))
                 self._trace_add_value("theta", float(theta))
                 if delta is not None:
                     self._trace_add_value("delta", delta)
@@ -1692,7 +1787,7 @@ class PDHG(nn.Module):
                 self._metric_history_add("sigma", sigma_d)
                 self._metric_history_add("rho", rho_d)
                 self._metric_history_add("tau", float(tau_k))
-                self._metric_history_add("sigma_dual", float(self.sigma_dual))
+                self._metric_history_add("sigma_dual", float(sigma_dual_k))
                 self._metric_history_add("theta", float(theta))
                 self._metric_history_add("elapsed_seconds_per_image", elapsed_seconds_per_image)
                 self._metric_history_add("p_norm", float(p_norm))
@@ -1747,7 +1842,7 @@ class PDHG(nn.Module):
                         "sigma": float(sigma_d),
                         "rho": float(rho_d),
                         "tau": float(tau_k),
-                        "sigma_dual": float(self.sigma_dual),
+                        "sigma_dual": float(sigma_dual_k),
                         "theta": float(theta),
                         "p_norm": float(p_norm),
                         "p_step_norm": float(p_step_norm),
@@ -1788,7 +1883,7 @@ class PDHG(nn.Module):
                     sigma=float(sigma_d),
                     rho=float(rho_d),
                     tau=float(tau_k),
-                    sigma_dual=float(self.sigma_dual),
+                    sigma_dual=float(sigma_dual_k),
                     theta=float(theta),
                     theorem1_tail_active=theorem1_tail_active,
                     elapsed_seconds_total=float(time.time() - start_time),
