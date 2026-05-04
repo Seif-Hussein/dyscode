@@ -910,6 +910,57 @@ class PDHG(nn.Module):
             return torch.where(denom <= eps, endpoint_min, seg_min)
 
     @staticmethod
+    def _phase_segment_stats(
+        seg_left: torch.Tensor,
+        seg_right: torch.Tensor,
+        y_amp: torch.Tensor,
+        sigma_n: float,
+        sigma_dual: float,
+        active_y_eps: float = 0.0,
+        prefix: str = "pr_ax_seg",
+        eps: float = 1e-12,
+    ) -> dict[str, float]:
+        """
+        Empirical phase-retrieval smoothness diagnostic suggested by the finite-horizon
+        argument: compare the minimum distance of a complex line segment to the
+        critical PR radius 2 eta y_i / (gamma + 2 eta).
+        """
+        eta_pr = 1.0 / max(float(sigma_n) ** 2, eps)
+        gamma_pr = float(sigma_dual)
+        stats = {
+            f"{prefix}_crit_radius_min": 0.0,
+            f"{prefix}_crit_radius_max": 0.0,
+            f"{prefix}_dist_min": 0.0,
+            f"{prefix}_ratio_min": 0.0,
+            f"{prefix}_ratio_mean": 0.0,
+            f"{prefix}_margin_min": 0.0,
+            f"{prefix}_violation_frac": 0.0,
+        }
+
+        with torch.no_grad():
+            active_mask = y_amp > max(float(active_y_eps), 0.0)
+            if not bool(active_mask.any().item()):
+                return stats
+
+            active_left = seg_left[active_mask]
+            active_right = seg_right[active_mask]
+            active_y = y_amp[active_mask]
+            crit_radius = (2.0 * eta_pr * active_y / (gamma_pr + 2.0 * eta_pr)).clamp_min(eps)
+            seg_min = PDHG._complex_segment_min_abs(active_left, active_right, eps=eps)
+            ratio = seg_min / crit_radius
+            margin = seg_min - crit_radius
+
+            stats[f"{prefix}_crit_radius_min"] = float(crit_radius.min().detach())
+            stats[f"{prefix}_crit_radius_max"] = float(crit_radius.max().detach())
+            stats[f"{prefix}_dist_min"] = float(seg_min.min().detach())
+            stats[f"{prefix}_ratio_min"] = float(ratio.min().detach())
+            stats[f"{prefix}_ratio_mean"] = float(ratio.mean().detach())
+            stats[f"{prefix}_margin_min"] = float(margin.min().detach())
+            stats[f"{prefix}_violation_frac"] = float((seg_min <= crit_radius).float().mean().detach())
+
+        return stats
+
+    @staticmethod
     def _phase_ax_segment_stats(
         ax_k: torch.Tensor,
         z_k1: torch.Tensor,
@@ -920,44 +971,44 @@ class PDHG(nn.Module):
         eps: float = 1e-12,
     ) -> dict[str, float]:
         """
-        Empirical phase-retrieval smoothness diagnostic suggested by the finite-horizon
-        argument: compare the minimum distance of the segment between (A x^k)_i and
-        z_i^{k+1} to the critical PR radius 2 eta y_i / (gamma + 2 eta).
+        Pathwise phase-retrieval margin check on the measurement-prox segment
+        between (A x^k)_i and z_i^{k+1}.
         """
-        eta_pr = 1.0 / max(float(sigma_n) ** 2, eps)
-        gamma_pr = float(sigma_dual)
-        stats = {
-            "pr_ax_seg_crit_radius_min": 0.0,
-            "pr_ax_seg_crit_radius_max": 0.0,
-            "pr_ax_seg_dist_min": 0.0,
-            "pr_ax_seg_ratio_min": 0.0,
-            "pr_ax_seg_ratio_mean": 0.0,
-            "pr_ax_seg_margin_min": 0.0,
-            "pr_ax_seg_violation_frac": 0.0,
-        }
+        return PDHG._phase_segment_stats(
+            seg_left=ax_k,
+            seg_right=z_k1,
+            y_amp=y_amp,
+            sigma_n=sigma_n,
+            sigma_dual=sigma_dual,
+            active_y_eps=active_y_eps,
+            prefix="pr_ax_seg",
+            eps=eps,
+        )
 
-        with torch.no_grad():
-            active_mask = y_amp > max(float(active_y_eps), 0.0)
-            if not bool(active_mask.any().item()):
-                return stats
-
-            active_ax = ax_k[active_mask]
-            active_z = z_k1[active_mask]
-            active_y = y_amp[active_mask]
-            crit_radius = (2.0 * eta_pr * active_y / (gamma_pr + 2.0 * eta_pr)).clamp_min(eps)
-            seg_min = PDHG._complex_segment_min_abs(active_ax, active_z, eps=eps)
-            ratio = seg_min / crit_radius
-            margin = seg_min - crit_radius
-
-            stats["pr_ax_seg_crit_radius_min"] = float(crit_radius.min().detach())
-            stats["pr_ax_seg_crit_radius_max"] = float(crit_radius.max().detach())
-            stats["pr_ax_seg_dist_min"] = float(seg_min.min().detach())
-            stats["pr_ax_seg_ratio_min"] = float(ratio.min().detach())
-            stats["pr_ax_seg_ratio_mean"] = float(ratio.mean().detach())
-            stats["pr_ax_seg_margin_min"] = float(margin.min().detach())
-            stats["pr_ax_seg_violation_frac"] = float((seg_min <= crit_radius).float().mean().detach())
-
-        return stats
+    @staticmethod
+    def _phase_ax_next_segment_stats(
+        ax_k: torch.Tensor,
+        ax_k1: torch.Tensor,
+        y_amp: torch.Tensor,
+        sigma_n: float,
+        sigma_dual: float,
+        active_y_eps: float = 0.0,
+        eps: float = 1e-12,
+    ) -> dict[str, float]:
+        """
+        Pathwise phase-retrieval margin check on the iterate segment between
+        (A x^k)_i and (A x^{k+1})_i.
+        """
+        return PDHG._phase_segment_stats(
+            seg_left=ax_k,
+            seg_right=ax_k1,
+            y_amp=y_amp,
+            sigma_n=sigma_n,
+            sigma_dual=sigma_dual,
+            active_y_eps=active_y_eps,
+            prefix="pr_ax_next_seg",
+            eps=eps,
+        )
 
     @staticmethod
     def _ct_local_smoothness_stats(
@@ -1110,6 +1161,9 @@ class PDHG(nn.Module):
             "pr_ax_seg_crit_radius_min", "pr_ax_seg_crit_radius_max",
             "pr_ax_seg_dist_min", "pr_ax_seg_ratio_min", "pr_ax_seg_ratio_mean",
             "pr_ax_seg_margin_min", "pr_ax_seg_violation_frac",
+            "pr_ax_next_seg_crit_radius_min", "pr_ax_next_seg_crit_radius_max",
+            "pr_ax_next_seg_dist_min", "pr_ax_next_seg_ratio_min", "pr_ax_next_seg_ratio_mean",
+            "pr_ax_next_seg_margin_min", "pr_ax_next_seg_violation_frac",
             "ct_local_L", "ct_local_log_L", "ct_gamma_half",
             "ct_local_L_over_gamma_half", "ct_log_L_minus_log_gamma_half",
             "ct_local_condition_holds", "ct_segment_min", "ct_segment_max",
@@ -1393,6 +1447,17 @@ class PDHG(nn.Module):
             y_k = x_k
             if mode == "phase_retrieval":
                 Kxk = operator.forward_complex(self._to_01(x_k))
+                if pr_dual_stats is not None:
+                    pr_dual_stats.update(
+                        self._phase_ax_next_segment_stats(
+                            ax_k=ax_k_for_segment,
+                            ax_k1=Kxk,
+                            y_amp=measurement,
+                            sigma_n=sigma_n,
+                            sigma_dual=self.sigma_dual,
+                            active_y_eps=self.phase_dual_active_y_eps,
+                        )
+                    )
             else:
                 Kxk = operator(x_k)
 
