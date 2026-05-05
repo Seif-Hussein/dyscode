@@ -138,6 +138,12 @@ class PDHG(nn.Module):
         )
         if self.sigma_dual_schedule_scope not in {"full", "tail"}:
             raise ValueError("sigma_dual_schedule_scope must be 'full' or 'tail'.")
+        self.sigma_dual_schedule_tail_steps = (
+            int(getattr(pdhg_cfg, "sigma_dual_schedule_tail_steps", 0))
+            if pdhg_cfg is not None else 0
+        )
+        if self.sigma_dual_schedule_tail_steps < 0:
+            raise ValueError("sigma_dual_schedule_tail_steps must be nonnegative.")
         self.sigma_dual_schedule_power = (
             float(getattr(pdhg_cfg, "sigma_dual_schedule_power", 1.0))
             if pdhg_cfg is not None else 1.0
@@ -401,7 +407,12 @@ class PDHG(nn.Module):
             return sigma_dual_schedule
 
         if self.sigma_dual_schedule_scope == "tail":
-            active_mask = np.asarray(tail_mask, dtype=bool).copy()
+            active_mask = np.zeros(total_steps, dtype=bool)
+            custom_tail_steps = min(int(self.sigma_dual_schedule_tail_steps), total_steps)
+            if custom_tail_steps > 0:
+                active_mask[total_steps - custom_tail_steps:] = True
+            else:
+                active_mask = np.asarray(tail_mask, dtype=bool).copy()
             if not bool(active_mask.any()):
                 return sigma_dual_schedule
         else:
@@ -1450,6 +1461,7 @@ class PDHG(nn.Module):
                 print(
                     "[PDHG] adaptive sigma_dual active: "
                     f"mode={self.sigma_dual_schedule_mode}, scope={self.sigma_dual_schedule_scope}, "
+                    f"tail_steps={self.sigma_dual_schedule_tail_steps}, "
                     f"power={self.sigma_dual_schedule_power:.3g}, "
                     f"gamma_anchor={sigma_dual_schedule[gamma_anchor_idx]:.6g}, "
                     f"gamma_next={sigma_dual_schedule[gamma_next_idx]:.6g}, "
