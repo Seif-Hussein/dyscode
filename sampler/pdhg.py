@@ -277,6 +277,31 @@ class PDHG(nn.Module):
             ("theorem1_tail_c", "tail_c"),
             None,
         )
+        final_tail_steps = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("final_tail_steps",),
+            0,
+        )
+        final_tail_c = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("final_tail_c",),
+            1.0,
+        )
+        final_tail_lambda = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("final_tail_lambda",),
+            None,
+        )
+        final_tail_rho_power = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("final_tail_rho_power",),
+            2.0,
+        )
+        final_tail_rho_scale = self._pop_tail_config_value(
+            annealing_scheduler_config,
+            ("final_tail_rho_scale",),
+            1.0,
+        )
 
         self.theorem1_tail_steps = max(0, int(tail_steps or 0))
         self.theorem1_tail_rho_power = float(rho_power if rho_power is not None else 2.0)
@@ -294,6 +319,22 @@ class PDHG(nn.Module):
         self.theorem1_tail_c = None if tail_c is None else float(tail_c)
         if self.theorem1_tail_c is not None and self.theorem1_tail_c <= 0.0:
             raise ValueError("theorem1_tail_c must be positive when set.")
+
+        self.final_tail_steps = max(0, int(final_tail_steps or 0))
+        self.final_tail_c = float(final_tail_c if final_tail_c is not None else 1.0)
+        if self.final_tail_c <= 0.0:
+            raise ValueError("final_tail_c must be positive.")
+        if isinstance(final_tail_lambda, str) and final_tail_lambda.lower() in {"", "none", "null"}:
+            final_tail_lambda = None
+        self.final_tail_lambda = None if final_tail_lambda is None else float(final_tail_lambda)
+        if self.final_tail_lambda is not None and self.final_tail_lambda <= 0.0:
+            raise ValueError("final_tail_lambda must be positive when set.")
+        self.final_tail_rho_power = float(final_tail_rho_power)
+        if self.final_tail_rho_power <= 0.0:
+            raise ValueError("final_tail_rho_power must be positive.")
+        self.final_tail_rho_scale = float(final_tail_rho_scale)
+        if self.final_tail_rho_scale <= 0.0:
+            raise ValueError("final_tail_rho_scale must be positive.")
 
         if 'sigma_max' in diffusion_scheduler_config:
             diffusion_scheduler_config.pop('sigma_max')
@@ -396,6 +437,32 @@ class PDHG(nn.Module):
             tau_schedule[k] = (sigma_k ** 2) / tail_lambda if tail_lambda is not None else float(self.tau) * (ratio ** 2)
             rho_schedule[k] = rho_scale * sigma_switch * (ratio ** rho_power)
             tail_mask[k] = True
+
+        final_tail_steps = min(int(self.final_tail_steps), total_steps)
+        if final_tail_steps > 0:
+            final_switch_idx = total_steps - final_tail_steps
+            final_sigma_switch = float(sigma_schedule[final_switch_idx])
+            if final_sigma_switch > 0.0:
+                final_c = float(self.final_tail_c)
+                final_lambda = self.final_tail_lambda
+                final_rho_power = float(self.final_tail_rho_power)
+                final_rho_scale = float(self.final_tail_rho_scale)
+                for k in range(final_switch_idx, total_steps):
+                    n = k - final_switch_idx
+                    ratio = math.sqrt(final_c / (final_c + n))
+                    sigma_k = final_sigma_switch * ratio
+                    sigma_schedule[k] = sigma_k
+                    tau_schedule[k] = (
+                        (sigma_k ** 2) / final_lambda
+                        if final_lambda is not None
+                        else float(tau_schedule[final_switch_idx]) * (ratio ** 2)
+                    )
+                    rho_schedule[k] = (
+                        final_rho_scale
+                        * final_sigma_switch
+                        * (ratio ** final_rho_power)
+                    )
+                    tail_mask[k] = True
 
         return sigma_schedule, tau_schedule, rho_schedule, tail_mask
 
@@ -1446,6 +1513,25 @@ class PDHG(nn.Module):
                 f"tail_c={self.theorem1_tail_c}, "
                 f"rho_power={self.theorem1_tail_rho_power:.3g}, "
                 f"lambda={self.theorem1_tail_lambda}"
+            )
+        final_tail_steps = min(int(self.final_tail_steps), K)
+        if final_tail_steps > 0:
+            final_switch_idx = K - final_tail_steps
+            final_next_idx = min(K - 1, final_switch_idx + 1)
+            print(
+                "[PDHG] final tail active: "
+                f"steps={final_tail_steps}, switch={final_switch_idx}, "
+                f"sigma_switch={sigma_schedule[final_switch_idx]:.6g}, "
+                f"sigma_next={sigma_schedule[final_next_idx]:.6g}, "
+                f"sigma_final={sigma_schedule[-1]:.6g}, "
+                f"tau_switch={tau_schedule[final_switch_idx]:.6g}, "
+                f"tau_final={tau_schedule[-1]:.6g}, "
+                f"rho_switch={rho_schedule[final_switch_idx]:.6g}, "
+                f"rho_final={rho_schedule[-1]:.6g}, "
+                f"tail_c={self.final_tail_c:.6g}, "
+                f"rho_power={self.final_tail_rho_power:.6g}, "
+                f"rho_scale={self.final_tail_rho_scale:.6g}, "
+                f"lambda={self.final_tail_lambda}"
             )
         if self.sigma_dual_schedule_mode != "constant":
             if self.sigma_dual_schedule_scope == "tail" and not bool(theorem1_tail_mask.any()):
